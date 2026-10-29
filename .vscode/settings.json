@@ -1,3 +1,20 @@
 {
-    "cmake.sourceDirectory": "C:/Users/alzer/Documents/projects/infertensorrt-rs/cpp"
+    "cmake.sourceDirectory": "${workspaceFolder}/cpp",
+    "cmake.useCMakePresets": "always",
+    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+    "C_Cpp.default.cppStandard": "c++23",
+    "C_Cpp.default.includePath": [
+        "${workspaceFolder}/cpp/include",
+        "${workspaceFolder}/cpp/include/tensorrt",
+        "${workspaceFolder}/cpp/src",
+        "${workspaceFolder}/cpp/build/x64-release/include",
+        "${workspaceFolder}/cpp/build/x64-debug/include",
+        "${workspaceFolder}/cpp/build/x64-release/vcpkg_installed/x64-windows/include",
+        "${workspaceFolder}/cpp/build/x64-debug/vcpkg_installed/x64-windows/include",
+        "${workspaceFolder}/cpp/thirdparty/tensorrt-samples/common",
+        "${workspaceFolder}/cpp/thirdparty/tensorrt-samples",
+        "C:/TensorRT-11.0.0.114/include",
+        "${env:CUDA_PATH}/include",
+        "${env:CUDA_PATH}/include/cccl"
+    ]
 }
