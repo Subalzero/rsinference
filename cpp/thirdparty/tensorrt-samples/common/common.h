@@ -236,7 +236,7 @@ inline int64_t volume(nvinfer1::Dims const& dims, int32_t start, int32_t stop)
     ASSERT(start >= 0);
     ASSERT(start <= stop);
     ASSERT(stop <= dims.nbDims);
-    ASSERT(std::all_of(dims.d + start, dims.d + stop, [](int32_t x) { return x >= 0; }));
+    ASSERT(std::all_of(dims.d + start, dims.d + stop, [](int64_t x) { return x >= 0; }));
     return std::accumulate(dims.d + start, dims.d + stop, int64_t{1}, std::multiplies<int64_t>{});
 }
 
