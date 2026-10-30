@@ -29,3 +29,6 @@ cpp/vcpkg_installed
 
 # TensorRT serialized engines
 *.engine
+
+# VSCode
+.vscode

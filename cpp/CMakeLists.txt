@@ -32,7 +32,8 @@ endif()
 # Library sources live in src/ (recursively), public headers in include/.
 # src/main.cpp is reserved for the optional standalone executable below.
 file(GLOB_RECURSE INFERTENSORRT_SOURCES CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/tensorrt/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/helpers/*.cpp"
 )
 list(REMOVE_ITEM INFERTENSORRT_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
 # src/samples/ holds standalone executables, not library sources.
@@ -121,7 +122,6 @@ add_library(infertensorrt::infertensorrt_cpp ALIAS infertensorrt_cpp)
 
 target_sources(infertensorrt_cpp PRIVATE
     ${INFERTENSORRT_SOURCES}
-    ${INFERTENSORRT_PUBLIC_HEADERS}
     ${TRT_SAMPLES_SOURCES}
 )
 
@@ -129,6 +129,7 @@ target_include_directories(infertensorrt_cpp
     PUBLIC
         "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
         "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>"
+        "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/public>"
         "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
     PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src"

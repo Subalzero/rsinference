@@ -14,7 +14,7 @@
 #include <typeinfo>
 #include <unordered_map>
 
-namespace inferrs {
+namespace rsinfer {
 
     enum DataType {
         FP16,

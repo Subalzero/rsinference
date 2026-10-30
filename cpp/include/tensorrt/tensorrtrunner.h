@@ -11,7 +11,7 @@
 #include "NvInfer.h"
 #include <cuda_runtime_api.h>
 
-namespace inferrs
+namespace rsinfer
 {
     using namespace nvinfer1;
 

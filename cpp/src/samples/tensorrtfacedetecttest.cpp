@@ -130,11 +130,11 @@ namespace
 
 	//! The model already applies softmax to `scores` and decodes `boxes`, so
 	//! only thresholding, scaling to the frame and NMS are left to do here.
-	std::vector<Detection> postprocess(const std::vector<inferrs::Tensor>& outputs,
+	std::vector<Detection> postprocess(const std::vector<rsinfer::Tensor>& outputs,
 		const cv::Size& frame_size, float score_threshold, float iou_threshold)
 	{
-		const inferrs::Tensor* scores = nullptr;
-		const inferrs::Tensor* boxes = nullptr;
+		const rsinfer::Tensor* scores = nullptr;
+		const rsinfer::Tensor* boxes = nullptr;
 		for (const auto& tensor : outputs)
 		{
 			if (tensor.name == "scores")
@@ -266,7 +266,7 @@ int main(int argc, char** argv)
 		capture.set(cv::CAP_PROP_FRAME_WIDTH, 640);
 		capture.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
 
-		inferrs::RunnerParams params;
+		rsinfer::RunnerParams params;
 		// locateFile() requires a non-empty dataDirs list; an empty entry
 		// means "use onnxFileName as given".
 		params.onnxFileName = model_path.string();
@@ -274,7 +274,7 @@ int main(int argc, char** argv)
 		params.nContexts = 1;
 
 		std::cout << "Building/loading TensorRT engine from " << model_path << " ..." << std::endl;
-		inferrs::TensorRTRunner runner(params);
+		rsinfer::TensorRTRunner runner(params);
 		if (!runner.build())
 		{
 			std::cerr << "Failed to build the TensorRT engine.\n";
@@ -311,18 +311,18 @@ int main(int argc, char** argv)
 
 			const int64_t start = cv::getTickCount();
 
-			inferrs::Tensor input;
+			rsinfer::Tensor input;
 			input.name = runner.get_input_tensor_name(0);
 			input.shape = { 1, 3, input_height, input_width };
-			input.dtype = inferrs::DataType::FP32;
+			input.dtype = rsinfer::DataType::FP32;
 			input.data = preprocess(frame, input_width, input_height);
 
-			std::vector<inferrs::Tensor> inputs;
+			std::vector<rsinfer::Tensor> inputs;
 			inputs.push_back(std::move(input));
 
 			runner.process(inputs);
 
-			std::vector<inferrs::Tensor> outputs;
+			std::vector<rsinfer::Tensor> outputs;
 			runner.get(outputs);
 
 			const std::vector<Detection> detections = postprocess(outputs, frame.size(), score_threshold, 0.5F);

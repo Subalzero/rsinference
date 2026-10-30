@@ -9,22 +9,22 @@
 #include <utility>
 #include <vector>
 
-namespace inferrs
+namespace rsinfer
 {
 	namespace
 	{
-		//! Maps a TensorRT element type onto the public inferrs::DataType enum.
-		inferrs::DataType to_inferrs_data_type(nvinfer1::DataType data_type) noexcept
+		//! Maps a TensorRT element type onto the public rsinfer::DataType enum.
+		rsinfer::DataType to_inferrs_data_type(nvinfer1::DataType data_type) noexcept
 		{
 			switch (data_type)
 			{
-			case nvinfer1::DataType::kFLOAT: return inferrs::DataType::FP32;
-			case nvinfer1::DataType::kHALF:  return inferrs::DataType::FP16;
-			case nvinfer1::DataType::kINT8:  return inferrs::DataType::INT8;
-			case nvinfer1::DataType::kBF16:  return inferrs::DataType::BF16;
-			case nvinfer1::DataType::kINT4:  return inferrs::DataType::INT4;
-			case nvinfer1::DataType::kFP4:   return inferrs::DataType::FP4;
-			default:                         return inferrs::DataType::UNKNOWN;
+			case nvinfer1::DataType::kFLOAT: return rsinfer::DataType::FP32;
+			case nvinfer1::DataType::kHALF:  return rsinfer::DataType::FP16;
+			case nvinfer1::DataType::kINT8:  return rsinfer::DataType::INT8;
+			case nvinfer1::DataType::kBF16:  return rsinfer::DataType::BF16;
+			case nvinfer1::DataType::kINT4:  return rsinfer::DataType::INT4;
+			case nvinfer1::DataType::kFP4:   return rsinfer::DataType::FP4;
+			default:                         return rsinfer::DataType::UNKNOWN;
 			}
 		}
 	} // namespace
