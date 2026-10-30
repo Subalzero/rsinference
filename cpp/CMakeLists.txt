@@ -259,6 +259,34 @@ if(BUILD_EXAMPLES AND TENSORRT_DIR)
 endif()
 
 # ---------------------------------------------------------------------------
+# Unit tests (CTest + GoogleTest)
+# ---------------------------------------------------------------------------
+include(CTest)
+if(BUILD_TESTING)
+    file(GLOB INFERTENSORRT_TEST_SOURCES CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp"
+    )
+    if(INFERTENSORRT_TEST_SOURCES)
+        add_executable(infertensorrt_cpp_tests ${INFERTENSORRT_TEST_SOURCES})
+        target_include_directories(infertensorrt_cpp_tests
+            PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include/public"
+        )
+        target_link_libraries(infertensorrt_cpp_tests
+            PRIVATE infertensorrt_cpp GTest::gtest GTest::gtest_main
+        )
+        infertensorrt_copy_runtime(infertensorrt_cpp_tests)
+        add_test(NAME rsinference_ffi COMMAND infertensorrt_cpp_tests)
+        # The DLL loads nvinfer_11.dll / nvonnxparser_11.dll at start-up; make
+        # sure the TensorRT runtime directory is on PATH for the test process.
+        if(TENSORRT_DIR)
+            set_tests_properties(rsinference_ffi PROPERTIES
+                ENVIRONMENT "PATH=${TENSORRT_DIR}\\bin\;$ENV{PATH}"
+            )
+        endif()
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Install / export
 # ---------------------------------------------------------------------------
 install(TARGETS infertensorrt_cpp

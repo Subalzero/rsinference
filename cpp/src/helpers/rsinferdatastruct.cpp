@@ -49,6 +49,29 @@ void rs_infer_fparray_destroy(RSInferFPArray* array)
     }
 }
 
+RSInferUCharArray* rs_infer_uchararray_create(size_t length)
+{
+    RSInferUCharArray* array = (RSInferUCharArray*)malloc(sizeof(RSInferUCharArray));
+    if (!array) {
+        return NULL;
+    }
+    array->data = (unsigned char*)malloc(length * sizeof(unsigned char));
+    if (!array->data) {
+        free(array);
+        return NULL;
+    }
+    array->length = length;
+    return array;
+}
+
+void rs_infer_uchararray_destroy(RSInferUCharArray* array)
+{
+    if (array) {
+        free(array->data);
+        free(array);
+    }
+}
+
 RSInferIntArray* rs_infer_intarray_create(size_t length)
 {
     RSInferIntArray* array = (RSInferIntArray*)malloc(sizeof(RSInferIntArray));

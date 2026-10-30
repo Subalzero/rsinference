@@ -278,7 +278,7 @@ namespace rsinfer
 		return data_type;
 	}
 
-	constexpr size_t TensorRTRunner::get_tensor_data_size(const nvinfer1::DataType& data_type) const
+	size_t TensorRTRunner::get_tensor_data_size(const nvinfer1::DataType& data_type) const
 	{
 		switch (data_type)
 		{

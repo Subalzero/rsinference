@@ -56,7 +56,7 @@ namespace rsinfer
         std::vector<int> get_input_shape(uint32_t index) const;
         std::vector<int> get_output_shape(uint32_t index) const;
         nvinfer1::DataType get_tensor_data_type(const std::string& name) const;
-        constexpr size_t get_tensor_data_size(const nvinfer1::DataType& data_type) const;
+        size_t get_tensor_data_size(const nvinfer1::DataType& data_type) const;
         std::string get_input_tensor_name(uint32_t index) const;
         std::string get_output_tensor_name(uint32_t index) const;
         size_t get_number_of_inputs() const;
