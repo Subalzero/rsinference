@@ -26,6 +26,7 @@ rustc-ice-*.txt
 # Cpp build artifacts
 cpp/build
 cpp/vcpkg_installed
+cpp/install
 
 # TensorRT serialized engines
 *.engine
