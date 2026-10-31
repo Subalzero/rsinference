@@ -22,8 +22,10 @@ impl Engine {
             source,
         })?;
 
-        // TODO: with the `ffi` feature, deserialize via the C++ bridge:
-        // infer_bridge_engine_deserialize(bytes.as_ptr(), bytes.len())
+        // TODO: with the `ffi` feature, drive the C++ runner instead of reading
+        // bytes here: Bridge::load_default(), then
+        // (bridge.runner_create)(model_ptr, config_ptr, &mut error) from
+        // `crate::dll`.
         let input = Shape {
             dims: Vec::new(),
             dtype: Dtype::F32,
@@ -55,7 +57,9 @@ impl Engine {
             return Err(InferError::FfiUnavailable);
         }
 
-        // TODO: call the generated bindings in `crate::ffi` here.
+        // TODO: call the runtime-resolved pointers in `crate::dll::Bridge`:
+        // runner_infer / runner_get_results on the FFI surface declared in
+        // cpp/include/public/rsinference.h.
         Ok(Vec::new())
     }
 }
@@ -70,6 +74,7 @@ mod tests {
         assert!(matches!(err, InferError::EngineLoad { .. }));
     }
 
+    #[cfg(not(feature = "ffi"))]
     #[test]
     fn infer_requires_ffi_feature() {
         let engine = Engine {

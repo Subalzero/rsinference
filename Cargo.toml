@@ -15,11 +15,14 @@ path = "src/main.rs"
 
 [dependencies]
 thiserror = "2"
+# Runtime symbol resolution against the C++ bridge DLL (no link-time dependency).
+libloading = { version = "0.8", optional = true }
 
 [build-dependencies]
 bindgen = "0.71"
 
 [features]
 default = []
-# Enable when the TensorRT C++ bridge is built and should be linked.
-ffi = []
+# Enable when the TensorRT C++ bridge DLL is built; the bindings are loaded
+# dynamically at runtime rather than linked at build time.
+ffi = ["dep:libloading"]

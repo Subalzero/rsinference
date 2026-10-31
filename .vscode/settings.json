@@ -16,5 +16,6 @@
         "C:/TensorRT-11.0.0.114/include",
         "${env:CUDA_PATH}/include",
         "${env:CUDA_PATH}/include/cccl"
-    ]
+    ],
+    "rust-analyzer.cargo.features": ["ffi"]
 }

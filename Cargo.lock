@@ -80,6 +80,7 @@ name = "infertensorrt-rs"
 version = "0.1.0"
 dependencies = [
  "bindgen",
+ "libloading",
  "thiserror",
 ]
 

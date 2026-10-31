@@ -23,6 +23,10 @@ pub enum InferError {
     /// An operation requires the `ffi` feature to be enabled.
     #[error("native TensorRT bridge not compiled (enable the `ffi` feature)")]
     FfiUnavailable,
+
+    /// The C++ bridge DLL could not be loaded, or one of its symbols is missing.
+    #[error("failed to load native bridge {path}: {message}")]
+    BridgeLoad { path: String, message: String },
 }
 
 pub type InferResult<T> = Result<T, InferError>;
