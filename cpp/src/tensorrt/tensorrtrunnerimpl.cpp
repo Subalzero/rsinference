@@ -111,6 +111,19 @@ int rs_inference_runner_infer(RSInferenceRunner* runner, RSInferTensorArray* inp
         for (size_t i = 0; i < input_tensors->length; ++i)
         {
             RSInferTensor* tensor = input_tensors->tensors[i];
+            // The Rust side is allowed to hand us a tensor whose payload is
+            // missing; report it instead of dereferencing null below.
+            if (!tensor || !tensor->shape || !tensor->data ||
+                (!tensor->shape->data && tensor->shape->length > 0) ||
+                (!tensor->data->data && tensor->data->length > 0))
+            {
+                if (error)
+                {
+                    error->code = ERROR_CODE_INVALID_ARGUMENTS;
+                    error->message = strdup("Input tensor is missing data or shape");
+                }
+                return ERROR_CODE_INVALID_ARGUMENTS;
+            }
             rsinfer::Tensor t;
             t.name = tensor->name;
             t.shape.assign(tensor->shape->data, tensor->shape->data + tensor->shape->length);
@@ -154,6 +167,19 @@ int rs_inference_runner_infer_async(RSInferenceRunner* runner, RSInferTensorArra
         for (size_t i = 0; i < input_tensors->length; ++i)
         {
             RSInferTensor* tensor = input_tensors->tensors[i];
+            // The Rust side is allowed to hand us a tensor whose payload is
+            // missing; report it instead of dereferencing null below.
+            if (!tensor || !tensor->shape || !tensor->data ||
+                (!tensor->shape->data && tensor->shape->length > 0) ||
+                (!tensor->data->data && tensor->data->length > 0))
+            {
+                if (error)
+                {
+                    error->code = ERROR_CODE_INVALID_ARGUMENTS;
+                    error->message = strdup("Input tensor is missing data or shape");
+                }
+                return ERROR_CODE_INVALID_ARGUMENTS;
+            }
             rsinfer::Tensor t;
             t.name = tensor->name;
             t.shape.assign(tensor->shape->data, tensor->shape->data + tensor->shape->length);
@@ -235,6 +261,19 @@ RSInferTensorArray* rs_inference_runner_get_results(RSInferenceRunner* runner, R
             }
             memcpy(shape_array->data, tensor.shape.data(), tensor.shape.size());
             output_array->tensors[i] = rs_infer_tensor_create(tensor.name.c_str(), tensor.name.size(), static_cast<RSInferDataType>(tensor.dtype), data_array, shape_array);
+            if (!output_array->tensors[i])
+            {
+                // `rs_infer_tensor_create` did not take ownership on failure.
+                if (error)
+                {
+                    error->code = ERROR_CODE_CREATION_FAILED;
+                    error->message = strdup("Failed to allocate memory for RSInferTensor");
+                }
+                rs_infer_uchararray_destroy(data_array);
+                rs_infer_llarray_destroy(shape_array);
+                rs_infer_tensorarray_destroy(output_array);
+                return nullptr;
+            }
         }
 
         return output_array;

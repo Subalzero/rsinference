@@ -4,8 +4,8 @@
 //! script never emits `cargo:rustc-link-lib`: bindgen only produces the type
 //! declarations, and the exported functions are resolved with `libloading`.
 //!
-//! Bindings are only generated when the `ffi` feature is enabled and the bridge
-//! header exists, so plain `cargo build` works without TensorRT.
+//! The native bridge is not optional: `src/ffi.rs` unconditionally includes the
+//! generated bindings, so a missing header is a hard build error.
 
 use std::env;
 use std::path::PathBuf;
@@ -18,20 +18,16 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=INFERTENSORRT_BIN_DIR");
 
-    if env::var_os("CARGO_FEATURE_FFI").is_none() {
-        return;
-    }
-
     // The public C-compatible surface lives in cpp/include/public/rsinference.h.
     let header_path = PathBuf::from("cpp/include")
         .join("public")
         .join("rsinference.h");
     if !header_path.exists() {
-        println!(
-            "cargo:warning=cpp/include/public/rsinference.h not found; skipping bindgen \
-             (build the C++ bridge first, e.g. cmake -S cpp -B cpp/build/x64-release)"
+        panic!(
+            "{} not found: the native bridge is required. Build the C++ bridge first, e.g. \
+             `cmake -S cpp -B cpp/build/x64-release`.",
+            header_path.display()
         );
-        return;
     }
 
     let bindings = bindgen::Builder::default()
@@ -56,8 +52,16 @@ fn main() {
         .write_to_file(out_path.join("ffi.rs"))
         .expect("couldn't write bindings");
 
-    // Locate the built DLL: the runtime loader needs the binary itself, not an
-    // import library. Set INFERTENSORRT_BIN_DIR to point at another build tree.
+    // Locate the built bridge: the runtime loader needs the shared library
+    // itself, not an import library. Set INFERTENSORRT_BIN_DIR to point at
+    // another build tree.
+    let file_name = format!(
+        "{}{}{}",
+        std::env::consts::DLL_PREFIX,
+        DLL_NAME,
+        std::env::consts::DLL_SUFFIX
+    );
+
     let candidates = [
         env::var_os("INFERTENSORRT_BIN_DIR").map(PathBuf::from),
         Some(PathBuf::from("cpp/install/x64-release/bin")),
@@ -68,45 +72,49 @@ fn main() {
     let dll = candidates
         .into_iter()
         .flatten()
-        .map(|dir| dir.join(format!("{DLL_NAME}.dll")))
+        .map(|dir| dir.join(&file_name))
         .find(|dll| dll.exists());
 
     match dll {
         Some(dll) => {
-            // Baked into the crate at compile time; `src/dll.rs` reads it with
-            // option_env! so a missing path degrades to a runtime error instead
-            // of a compile error.
-            println!(
-                "cargo:rustc-env=INFERTENSORRT_DLL={}",
-                dll.to_string_lossy()
-            );
-
-            // Copy the DLL next to the executable so a bare `Library::new(
-            // "infertensorrt_cpp.dll")` resolves via the exe's own directory.
-            // OUT_DIR is target/<profile>/build/<pkg>-<hash>/out, so the profile
-            // directory is three levels up.
+            // Copy the bridge next to the built artifacts so
+            // `Bridge::load_default` resolves it through the exe directory.
+            // `target/<profile>` holds the binaries; `target/<profile>/deps`
+            // holds test and bench executables.
+            // OUT_DIR is target/<profile>/build/<pkg>-<hash>/out, so the
+            // profile directory is three levels up.
             if let Some(profile_dir) = out_path.ancestors().nth(3) {
-                let target = profile_dir.join(format!("{DLL_NAME}.dll"));
-                match std::fs::copy(&dll, &target) {
-                    Ok(_) => println!(
-                        "cargo:warning=copied {} to {}",
-                        DLL_NAME,
-                        target.to_string_lossy()
-                    ),
-                    Err(err) => println!(
-                        "cargo:warning=could not copy {} to {} ({err}); put the DLL's \
-                         directory on PATH",
-                        DLL_NAME,
-                        target.to_string_lossy()
-                    ),
+                for (dir, announce) in [
+                    (profile_dir.to_path_buf(), true),
+                    (profile_dir.join("deps"), false),
+                ] {
+                    if !dir.exists() && std::fs::create_dir_all(&dir).is_err() {
+                        continue;
+                    }
+                    let target = dir.join(&file_name);
+                    match std::fs::copy(&dll, &target) {
+                        Ok(_) if announce => println!(
+                            "cargo:warning=copied {} to {}",
+                            file_name,
+                            target.to_string_lossy()
+                        ),
+                        Ok(_) => {}
+                        Err(err) => println!(
+                            "cargo:warning=could not copy {} to {} ({err}); put the bridge's \
+                             directory on PATH",
+                            file_name,
+                            target.to_string_lossy()
+                        ),
+                    }
                 }
             }
         }
         None => {
             println!(
-                "cargo:warning={DLL_NAME}.dll not found; the ffi bindings are generated but \
-                 the runtime loader will fail (install the C++ bridge, e.g. cmake --install \
-                 cpp/build/x64-release --prefix cpp/install)"
+                "cargo:warning={file_name} not found; the crate builds, but loading the \
+                 bridge will fail at runtime (install the C++ bridge, e.g. \
+                 `cmake --install cpp/build/x64-release --prefix cpp/install`, or set \
+                 INFERTENSORRT_BIN_DIR)"
             );
         }
     }

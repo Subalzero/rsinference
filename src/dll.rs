@@ -6,13 +6,11 @@
 //! are therefore unused — call the pointers on [`Bridge`] instead.
 //!
 //! ```no_run
-//! # #[cfg(feature = "ffi")]
-//! # {
-//! use infertensorrt_rs::dll::Bridge;
+//! use rsinference::dll::Bridge;
 //!
 //! let bridge = Bridge::load_default().unwrap();
 //! unsafe {
-//!     let mut error = infertensorrt_rs::dll::new_error();
+//!     let mut error = rsinference::dll::new_error();
 //!     let runner = (bridge.runner_create)(
 //!         b"demo.engine\0".as_ptr() as *const std::ffi::c_char,
 //!         std::ptr::null(),
@@ -22,13 +20,13 @@
 //!         (bridge.runner_destroy)(runner);
 //!     }
 //! }
-//! # }
 //! ```
 //!
 //! Keep the [`Bridge`] alive for the whole program: dropping it unloads the DLL
 //! and invalidates every function pointer it handed out.
 
 use libloading::Library;
+use std::marker::PhantomData;
 use std::os::raw::{c_char, c_int, c_uint};
 use std::path::{Path, PathBuf};
 
@@ -189,6 +187,12 @@ pub struct Bridge {
     /// Path the DLL was loaded from, for diagnostics.
     pub path: PathBuf,
 
+    /// Backend runtimes are not guaranteed to be thread-safe, so a `Bridge` is
+    /// deliberately neither `Send` nor `Sync`. Without this marker the raw
+    /// function pointers would make it both, allowing two threads to drive the
+    /// same native runner.
+    _not_send: PhantomData<*mut ()>,
+
     pub llarray_create: FnLlarrayCreate,
     pub llarray_destroy: FnLlarrayDestroy,
 
@@ -235,14 +239,17 @@ impl std::fmt::Debug for Bridge {
 const DLL_NAME: &str = "infertensorrt_cpp";
 
 /// File name the loader looks for on the current platform.
+fn library_file_name(backend: &str) -> String {
+    format!(
+        "{}{}{}",
+        std::env::consts::DLL_PREFIX,
+        backend,
+        std::env::consts::DLL_SUFFIX
+    )
+}
+
 fn dll_file_name() -> String {
-    if cfg!(windows) {
-        format!("{DLL_NAME}.dll")
-    } else if cfg!(target_os = "macos") {
-        format!("lib{DLL_NAME}.dylib")
-    } else {
-        format!("lib{DLL_NAME}.so")
-    }
+    library_file_name(DLL_NAME)
 }
 
 /// Resolve one exported symbol and copy the function pointer out of the
@@ -323,19 +330,20 @@ impl Bridge {
                 )?,
                 path,
                 lib,
+                _not_send: PhantomData,
             })
         }
     }
 
-    /// Try the path baked in by `build.rs`, then the executable's directory,
-    /// then a bare name resolved through the platform search order (`PATH`).
+    /// Try the executable's directory, then a bare name resolved through the
+    /// platform search order (`PATH`).
+    ///
+    /// Nothing machine-specific is baked into the binary: a published build
+    /// works wherever the bridge happens to be installed.
     pub fn load_default() -> InferResult<Self> {
         let name = dll_file_name();
         let mut candidates: Vec<PathBuf> = Vec::new();
 
-        if let Some(baked) = option_env!("INFERTENSORRT_DLL") {
-            candidates.push(PathBuf::from(baked));
-        }
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 candidates.push(dir.join(&name));
@@ -348,7 +356,8 @@ impl Bridge {
             message: "no candidate path existed".to_string(),
         };
         for candidate in candidates {
-            if !candidate.exists() && candidate != PathBuf::from(&name) {
+            let is_bare_name = candidate == PathBuf::from(&name);
+            if !candidate.exists() && !is_bare_name {
                 last = InferError::BridgeLoad {
                     path: candidate.display().to_string(),
                     message: "file not found".to_string(),
@@ -366,14 +375,7 @@ impl Bridge {
     /// Load a backend by CMake target name from `dir`, e.g.
     /// `Bridge::load_backend("bin", "inferonnx_cpp")`.
     pub fn load_backend(dir: impl AsRef<Path>, backend: &str) -> InferResult<Self> {
-        let file = if cfg!(windows) {
-            format!("{backend}.dll")
-        } else if cfg!(target_os = "macos") {
-            format!("lib{backend}.dylib")
-        } else {
-            format!("lib{backend}.so")
-        };
-        Self::load(dir.as_ref().join(file))
+        Self::load(dir.as_ref().join(library_file_name(backend)))
     }
 
     /// Release the DLL handle (`Library::close`). After this call every
@@ -417,7 +419,7 @@ pub fn take_error(error: &mut ffi::RSInferError, bridge: &Bridge) -> Option<Infe
     unsafe { (bridge.error_cleanmsg)(error) };
     error.code = 0;
     error.message = std::ptr::null_mut();
-    Some(InferError::TensorRt { message })
+    Some(InferError::Backend { message })
 }
 
 /// `c_int` result -> `Result<()>`, folding in the error struct when non-zero.
@@ -427,7 +429,7 @@ pub fn check(code: c_int, error: &mut ffi::RSInferError, bridge: &Bridge) -> Inf
     }
     match take_error(error, bridge) {
         Some(err) => Err(err),
-        None => Err(InferError::TensorRt {
+        None => Err(InferError::Backend {
             message: format!("native call failed with code {code}"),
         }),
     }

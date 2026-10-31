@@ -76,15 +76,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
-name = "infertensorrt-rs"
-version = "0.1.0"
-dependencies = [
- "bindgen",
- "libloading",
- "thiserror",
-]
-
-[[package]]
 name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -193,6 +184,15 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "rsinference"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "libloading",
+ "thiserror",
+]
 
 [[package]]
 name = "rustc-hash"

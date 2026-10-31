@@ -1,28 +1,22 @@
 [package]
-name = "infertensorrt-rs"
+name = "rsinference"
 version = "0.1.0"
 edition = "2021"
-description = "A small infer bridge for TensorRT written in Rust"
+description = "A Rust inference bridge with pluggable native backends (TensorRT, ONNX Runtime, OpenVINO)"
 license = "MIT"
 
 [lib]
-name = "infertensorrt_rs"
+name = "rsinference"
 path = "src/lib.rs"
 
 [[bin]]
-name = "infertensorrt-rs"
+name = "rsinference"
 path = "src/main.rs"
 
 [dependencies]
 thiserror = "2"
 # Runtime symbol resolution against the C++ bridge DLL (no link-time dependency).
-libloading = { version = "0.8", optional = true }
+libloading = "0.8"
 
 [build-dependencies]
 bindgen = "0.71"
-
-[features]
-default = []
-# Enable when the TensorRT C++ bridge DLL is built; the bindings are loaded
-# dynamically at runtime rather than linked at build time.
-ffi = ["dep:libloading"]

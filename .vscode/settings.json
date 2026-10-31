@@ -17,5 +17,5 @@
         "${env:CUDA_PATH}/include",
         "${env:CUDA_PATH}/include/cccl"
     ],
-    "rust-analyzer.cargo.features": ["ffi"]
+    "rust-analyzer.cargo.features": []
 }

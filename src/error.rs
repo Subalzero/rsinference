@@ -1,8 +1,11 @@
-//! Error types for the TensorRT infer bridge.
+//! Error types for the inference bridge.
 
 use std::fmt;
 
+use crate::engine::EngineType;
+
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum InferError {
     /// The serialized engine file could not be read or deserialized.
     #[error("failed to load engine at {path}: {source}")]
@@ -12,21 +15,22 @@ pub enum InferError {
         source: std::io::Error,
     },
 
-    /// TensorRT returned a failure while building or running the engine.
-    #[error("tensorrt error: {message}")]
-    TensorRt { message: String },
+    /// The backend reported a failure while building or running the engine.
+    #[error("backend error: {message}")]
+    Backend { message: String },
 
     /// The input tensor shape does not match the engine's expected shape.
     #[error("shape mismatch: expected {expected}, got {actual}")]
     ShapeMismatch { expected: String, actual: String },
 
-    /// An operation requires the `ffi` feature to be enabled.
-    #[error("native TensorRT bridge not compiled (enable the `ffi` feature)")]
-    FfiUnavailable,
-
-    /// The C++ bridge DLL could not be loaded, or one of its symbols is missing.
+    /// The C++ bridge library could not be loaded, or one of its symbols is
+    /// missing.
     #[error("failed to load native bridge {path}: {message}")]
     BridgeLoad { path: String, message: String },
+
+    /// The requested backend has no native bridge in this build.
+    #[error("backend {engine_type} is not implemented yet")]
+    UnsupportedBackend { engine_type: EngineType },
 }
 
 pub type InferResult<T> = Result<T, InferError>;

@@ -1,66 +1,161 @@
-//! TensorRT engine handling.
+//! Engine handling shared by all backends.
 
-use crate::error::{Dtype, InferError, InferResult, Shape};
+use std::path::{Path, PathBuf};
 
-/// A loaded (or to-be-loaded) TensorRT engine.
+use crate::error::{InferError, InferResult};
+use crate::Bridge;
+
+/// Inference backend an [`Engine`] talks to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EngineType {
+    TensorRT,
+    OpenVINO,
+    ONNX,
+}
+
+impl EngineType {
+    /// Whether the C++ bridge for this backend exists in this repository.
+    ///
+    /// Backends without a bridge are rejected with
+    /// [`InferError::UnsupportedBackend`] instead of a misleading "file not
+    /// found" when the loader looks for a library that was never built.
+    pub const fn is_implemented(self) -> bool {
+        matches!(self, EngineType::TensorRT)
+    }
+
+    /// CMake target name of the C++ bridge that implements this backend.
+    ///
+    /// [`Bridge::load_backend`] turns this into `infertensorrt_cpp.dll`,
+    /// `libinfertensorrt_cpp.so`, `libinfertensorrt_cpp.dylib`, ... for the
+    /// platform the crate was built for.
+    const fn bridge_name(self) -> &'static str {
+        match self {
+            EngineType::TensorRT => "infertensorrt_cpp",
+            EngineType::OpenVINO => "inferopenvino_cpp",
+            EngineType::ONNX => "inferonnx_cpp",
+        }
+    }
+}
+
+impl std::fmt::Display for EngineType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            EngineType::TensorRT => "TensorRT",
+            EngineType::OpenVINO => "OpenVINO",
+            EngineType::ONNX => "ONNX Runtime",
+        })
+    }
+}
+
+/// Directory holding the per-backend bridge libraries.
+const DEFAULT_BACKEND_PATH: &str = "backends";
+
+/// Candidate bridge directories, in priority order:
+///
+/// 1. `RSINFER_BACKEND_PATH` at runtime,
+/// 2. `RSINFER_BACKEND_PATH` baked in at build time,
+/// 3. `<executable dir>/backends` (the reliable location for installed apps),
+/// 4. `backends` relative to the current working directory (dev convenience).
+fn backend_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    if let Some(dir) = std::env::var_os("RSINFER_BACKEND_PATH") {
+        dirs.push(PathBuf::from(dir));
+    }
+    if let Some(dir) = option_env!("RSINFER_BACKEND_PATH") {
+        let dir = PathBuf::from(dir);
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let dir = parent.join(DEFAULT_BACKEND_PATH);
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+    }
+    let cwd = PathBuf::from(DEFAULT_BACKEND_PATH);
+    if !dirs.contains(&cwd) {
+        dirs.push(cwd);
+    }
+
+    dirs
+}
+
+/// Load the bridge for `engine_type`, trying every candidate directory.
+fn load_bridge(engine_type: EngineType) -> InferResult<Bridge> {
+    let mut last = None;
+    for dir in backend_dirs() {
+        match Bridge::load_backend(&dir, engine_type.bridge_name()) {
+            Ok(bridge) => return Ok(bridge),
+            Err(err) => last = Some(err),
+        }
+    }
+    Err(last.unwrap_or_else(|| InferError::BridgeLoad {
+        path: engine_type.bridge_name().to_string(),
+        message: "no backend directory candidates".to_string(),
+    }))
+}
+
+/// A loaded engine and its native backend bridge.
 #[derive(Debug)]
 pub struct Engine {
-    /// Path to the serialized `.engine` file on disk.
-    pub path: std::path::PathBuf,
-    /// Input tensor the engine expects.
-    pub input: Shape,
-    /// Output tensor the engine produces.
-    pub output: Shape,
+    path: PathBuf,
+    engine_type: EngineType,
+    /// Must outlive every call made through it; declared last so it drops after
+    /// the fields above.
+    bridge: Bridge,
 }
 
 impl Engine {
-    /// Load a serialized engine from disk.
-    pub fn load(path: impl Into<std::path::PathBuf>) -> InferResult<Self> {
+    /// Load a serialized engine from disk and open its backend bridge.
+    pub fn load(path: impl Into<PathBuf>, engine_type: EngineType) -> InferResult<Self> {
         let path = path.into();
-        let _bytes = std::fs::read(&path).map_err(|source| InferError::EngineLoad {
+
+        // Report unimplemented backends as such, before blaming the filesystem.
+        if !engine_type.is_implemented() {
+            return Err(InferError::UnsupportedBackend { engine_type });
+        }
+
+        let metadata = std::fs::metadata(&path).map_err(|source| InferError::EngineLoad {
             path: path.display().to_string(),
             source,
         })?;
-
-        // TODO: with the `ffi` feature, drive the C++ runner instead of reading
-        // bytes here: Bridge::load_default(), then
-        // (bridge.runner_create)(model_ptr, config_ptr, &mut error) from
-        // `crate::dll`.
-        let input = Shape {
-            dims: Vec::new(),
-            dtype: Dtype::F32,
-        };
-        let output = Shape {
-            dims: Vec::new(),
-            dtype: Dtype::F32,
-        };
-
-        Ok(Self {
-            path,
-            input,
-            output,
-        })
-    }
-
-    /// Run inference on `input`. Length must match the engine's input shape.
-    pub fn infer(&self, input: &[f32]) -> InferResult<Vec<f32>> {
-        let actual = input.len();
-        let expected = self.input.dims.iter().product::<usize>();
-        if expected > 0 && actual != expected {
-            return Err(InferError::ShapeMismatch {
-                expected: expected.to_string(),
-                actual: actual.to_string(),
+        if !metadata.is_file() {
+            return Err(InferError::EngineLoad {
+                path: path.display().to_string(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "path is not a regular file",
+                ),
             });
         }
 
-        if !cfg!(feature = "ffi") {
-            return Err(InferError::FfiUnavailable);
-        }
+        let bridge = load_bridge(engine_type)?;
 
-        // TODO: call the runtime-resolved pointers in `crate::dll::Bridge`:
-        // runner_infer / runner_get_results on the FFI surface declared in
-        // cpp/include/public/rsinference.h.
-        Ok(Vec::new())
+        Ok(Self {
+            path,
+            engine_type,
+            bridge,
+        })
+    }
+
+    /// Path of the model file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Backend that runs the model.
+    pub fn engine_type(&self) -> EngineType {
+        self.engine_type
+    }
+
+    /// The backend bridge loaded for this engine.
+    pub fn bridge(&self) -> &Bridge {
+        &self.bridge
     }
 }
 
@@ -70,27 +165,13 @@ mod tests {
 
     #[test]
     fn load_missing_engine_reports_error() {
-        let err = Engine::load("definitely-not-an.engine").unwrap_err();
+        let err = Engine::load("definitely-not-an.engine", EngineType::TensorRT).unwrap_err();
         assert!(matches!(err, InferError::EngineLoad { .. }));
     }
 
-    #[cfg(not(feature = "ffi"))]
     #[test]
-    fn infer_requires_ffi_feature() {
-        let engine = Engine {
-            path: std::path::PathBuf::from("demo.engine"),
-            input: Shape {
-                dims: vec![2],
-                dtype: Dtype::F32,
-            },
-            output: Shape {
-                dims: vec![2],
-                dtype: Dtype::F32,
-            },
-        };
-        assert!(matches!(
-            engine.infer(&[1.0, 2.0]),
-            Err(InferError::FfiUnavailable)
-        ));
+    fn unimplemented_backend_is_reported() {
+        let err = Engine::load("model.engine", EngineType::ONNX).unwrap_err();
+        assert!(matches!(err, InferError::UnsupportedBackend { .. }));
     }
 }

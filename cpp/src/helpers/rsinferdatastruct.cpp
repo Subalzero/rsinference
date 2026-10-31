@@ -105,6 +105,12 @@ void rs_infer_error_cleanmsg(RSInferError* error)
 
 RSInferTensor* rs_infer_tensor_create(const char* name, size_t name_length, RSInferDataType dtype, RSInferUCharArray* data, RSInferLLArray* shape)
 {
+    // `rs_infer_tensor_destroy` takes ownership of `data` and `shape`, so both
+    // must be real allocations. Reject null here instead of letting later
+    // code dereference it.
+    if (!name || !data || !shape) {
+        return NULL;
+    }
     RSInferTensor* tensor = (RSInferTensor*)malloc(sizeof(RSInferTensor));
     if (!tensor) {
         return NULL;
@@ -139,7 +145,9 @@ RSInferTensorArray* rs_infer_tensorarray_create(size_t length)
     if (!array) {
         return NULL;
     }
-    array->tensors = (RSInferTensor**)malloc(length * sizeof(RSInferTensor*));
+    // Zeroed so that a partially filled array is still safe to destroy:
+    // `rs_infer_tensorarray_destroy` walks every slot.
+    array->tensors = (RSInferTensor**)calloc(length, sizeof(RSInferTensor*));
     if (!array->tensors) {
         free(array);
         return NULL;
