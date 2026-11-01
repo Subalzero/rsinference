@@ -76,28 +76,24 @@ fn main() -> Result<(), rsinference::InferError> {
 backend:
 
 ```rust
-// default: <working dir>/backends/infertensorrt_cpp.dll
 Engine::load("model.engine", EngineType::TensorRT)?;
 ```
 
-The bridge directory is resolved, in order, from:
-
-1. the `RSINFER_BACKEND_PATH` environment variable at runtime,
-2. the `RSINFER_BACKEND_PATH` value baked in at build time (`option_env!`),
-3. `<directory of the executable>/backends`,
-4. `backends/` relative to the working directory.
+The model path is used exactly as given. The bridge library is resolved the same
+way as `Bridge::load_default_backend()`: first next to the executable, then by
+its bare file name through the platform search order (`PATH`).
 
 If you prefer to find the library yourself, use `Bridge` directly:
 
 ```rust
 use rsinference::{Bridge, EngineType};
 
-let bridge = Bridge::load_default()?;                       // baked path -> exe dir -> PATH
+let bridge = Bridge::load_default_backend()?;              // exe dir -> PATH
 let bridge = Bridge::load("C:/sdk/my_bridge.dll")?;         // explicit file
-let bridge = Bridge::load_backend("backends", "inferonnx_cpp")?; // by backend name
+let bridge = Bridge::load_backend("inferonnx_cpp")?;        // by backend name
 ```
 
-`Bridge::load_default()` searches, in order:
+`Bridge::load_default_backend()` searches, in order:
 
 1. the bridge library next to the current executable,
 2. the bare library file name, resolved through the platform search order (`PATH`).
@@ -129,8 +125,8 @@ application. This crate does not download, vendor, or install vendor SDKs.
 
 ### Making the vendor libraries resolvable
 
-Put the bridge library where `Engine::load` / `Bridge::load_default()` looks
-(see above), **and** make the backend's own libraries resolvable — usually by
+Put the bridge library where `Engine::load` / `Bridge::load_default_backend()`
+looks (see above), **and** make the backend's own libraries resolvable — usually by
 adding their directories to `PATH` before starting the program:
 
 ```powershell
@@ -162,9 +158,9 @@ feature-gated.
 | `cpp/include/public/rsinference.h` | parsed by `build.rs`; missing header = build error |
 | `INFERTENSORRT_BIN_DIR` | optional, points the build at a custom DLL directory |
 
-`build.rs` copies the bridge next to the built binary so `Bridge::load_default()`
-finds it through the executable directory. Nothing machine-specific is baked
-into the crate.
+`build.rs` copies the bridge next to the built binary so
+`Bridge::load_default_backend()` finds it through the executable directory.
+Nothing machine-specific is baked into the crate.
 
 ## Errors
 

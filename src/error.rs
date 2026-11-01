@@ -1,8 +1,22 @@
 //! Error types for the inference bridge.
-
-use std::fmt;
-
 use crate::engine::EngineType;
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum EngineError {
+    /// The serialized engine file could not be read or deserialized.
+    #[error("failed to load engine at {path}: {source}")]
+    Load { path: String, #[source] source: std::io::Error },
+
+    #[error("backend {engine_type} is not implemented yet")]
+    UnsupportedBackend { engine_type: EngineType },
+
+     #[error("failed to load native bridge {path}: {message}")]
+    BridgeLoad { path: String, message: String },
+
+    #[error("bridge error: {message}")]
+    Engine { message: String },
+}
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -33,31 +47,22 @@ pub enum InferError {
     UnsupportedBackend { engine_type: EngineType },
 }
 
-pub type InferResult<T> = Result<T, InferError>;
-
-impl fmt::Display for Shape {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let dims = self
-            .dims
-            .iter()
-            .map(|d| d.to_string())
-            .collect::<Vec<_>>()
-            .join("x");
-        write!(f, "{}", dims)
+impl From<DataError> for InferError {
+    fn from(err: DataError) -> Self {
+        InferError::Backend {
+            message: format!("data error: {}", err),
+        }
     }
 }
 
-/// Tensor shape: dimensions in row-major order, plus element kind.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Shape {
-    pub dims: Vec<usize>,
-    pub dtype: Dtype,
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum DataError {
+    // The DataStructure cannot be created from the given data, e.g. a tensor shape is invalid.
+    #[error("invalid data structure: {datatype} - {message}")]
+    InvalidStructure { datatype: String, message: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Dtype {
-    F32,
-    F16,
-    I32,
-    U8,
-}
+pub type InferResult<T> = Result<T, InferError>;
+pub type EngineResult<T> = Result<T, EngineError>;
+pub type DataResult<T> = Result<T, DataError>;

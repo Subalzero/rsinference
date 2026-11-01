@@ -12,6 +12,7 @@ pub mod dll;
 pub mod engine;
 pub mod error;
 pub mod ffi;
+pub mod types;
 
 pub use dll::Bridge;
 pub use engine::{Engine, EngineType};

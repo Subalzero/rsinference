@@ -8,7 +8,7 @@
 //! ```no_run
 //! use rsinference::dll::Bridge;
 //!
-//! let bridge = Bridge::load_default().unwrap();
+//! let bridge = Bridge::load_default_backend().unwrap();
 //! unsafe {
 //!     let mut error = rsinference::dll::new_error();
 //!     let runner = (bridge.runner_create)(
@@ -26,11 +26,10 @@
 //! and invalidates every function pointer it handed out.
 
 use libloading::Library;
-use std::marker::PhantomData;
 use std::os::raw::{c_char, c_int, c_uint};
 use std::path::{Path, PathBuf};
 
-use crate::error::{InferError, InferResult};
+use crate::error::{EngineError, EngineResult, InferError, InferResult};
 use crate::ffi;
 
 // ---------------------------------------------------------------------------
@@ -187,12 +186,6 @@ pub struct Bridge {
     /// Path the DLL was loaded from, for diagnostics.
     pub path: PathBuf,
 
-    /// Backend runtimes are not guaranteed to be thread-safe, so a `Bridge` is
-    /// deliberately neither `Send` nor `Sync`. Without this marker the raw
-    /// function pointers would make it both, allowing two threads to drive the
-    /// same native runner.
-    _not_send: PhantomData<*mut ()>,
-
     pub llarray_create: FnLlarrayCreate,
     pub llarray_destroy: FnLlarrayDestroy,
 
@@ -248,16 +241,12 @@ fn library_file_name(backend: &str) -> String {
     )
 }
 
-fn dll_file_name() -> String {
-    library_file_name(DLL_NAME)
-}
-
 /// Resolve one exported symbol and copy the function pointer out of the
 /// `Symbol`, so the struct never borrows its own `Library` field.
-unsafe fn lookup<T: Copy>(lib: &Library, name: &[u8], path: &str) -> InferResult<T> {
+unsafe fn lookup<T: Copy>(lib: &Library, name: &[u8], path: &str) -> EngineResult<T> {
     lib.get::<T>(name)
         .map(|symbol| *symbol)
-        .map_err(|source| InferError::BridgeLoad {
+        .map_err(|source| EngineError::BridgeLoad {
             path: path.to_string(),
             message: format!(
                 "missing symbol {} ({source})",
@@ -268,11 +257,11 @@ unsafe fn lookup<T: Copy>(lib: &Library, name: &[u8], path: &str) -> InferResult
 
 impl Bridge {
     /// Load the bridge DLL from `path` and resolve every exported symbol.
-    pub fn load(path: impl AsRef<Path>) -> InferResult<Self> {
+    pub fn load(path: impl AsRef<Path>) -> EngineResult<Self> {
         let path = path.as_ref().to_path_buf();
         let display = path.display().to_string();
 
-        let lib = unsafe { Library::new(&path) }.map_err(|source| InferError::BridgeLoad {
+        let lib = unsafe { Library::new(&path) }.map_err(|source| EngineError::BridgeLoad {
             path: display.clone(),
             message: source.to_string(),
         })?;
@@ -330,7 +319,6 @@ impl Bridge {
                 )?,
                 path,
                 lib,
-                _not_send: PhantomData,
             })
         }
     }
@@ -340,8 +328,14 @@ impl Bridge {
     ///
     /// Nothing machine-specific is baked into the binary: a published build
     /// works wherever the bridge happens to be installed.
-    pub fn load_default() -> InferResult<Self> {
-        let name = dll_file_name();
+    pub fn load_default_backend() -> EngineResult<Self> {
+        Self::load_backend(DLL_NAME)
+    }
+
+    /// Like [`Bridge::load_default_backend`], but for the bridge named `backend`
+    /// (e.g. `"inferonnx_cpp"`).
+    pub fn load_backend(backend: &str) -> EngineResult<Self> {
+        let name = library_file_name(backend);
         let mut candidates: Vec<PathBuf> = Vec::new();
 
         if let Ok(exe) = std::env::current_exe() {
@@ -351,14 +345,14 @@ impl Bridge {
         }
         candidates.push(PathBuf::from(&name));
 
-        let mut last = InferError::BridgeLoad {
+        let mut last = EngineError::BridgeLoad {
             path: name.clone(),
             message: "no candidate path existed".to_string(),
         };
         for candidate in candidates {
             let is_bare_name = candidate == PathBuf::from(&name);
             if !candidate.exists() && !is_bare_name {
-                last = InferError::BridgeLoad {
+                last = EngineError::BridgeLoad {
                     path: candidate.display().to_string(),
                     message: "file not found".to_string(),
                 };
@@ -372,18 +366,12 @@ impl Bridge {
         Err(last)
     }
 
-    /// Load a backend by CMake target name from `dir`, e.g.
-    /// `Bridge::load_backend("bin", "inferonnx_cpp")`.
-    pub fn load_backend(dir: impl AsRef<Path>, backend: &str) -> InferResult<Self> {
-        Self::load(dir.as_ref().join(library_file_name(backend)))
-    }
-
     /// Release the DLL handle (`Library::close`). After this call every
     /// function pointer on the struct is dangling, so only call it when the
     /// bridge is truly done; dropping a `Bridge` unloads the DLL too.
-    pub fn unload(self) -> InferResult<()> {
+    pub fn unload(self) -> EngineResult<()> {
         let path = self.path.display().to_string();
-        self.lib.close().map_err(|source| InferError::BridgeLoad {
+        self.lib.close().map_err(|source| EngineError::BridgeLoad {
             path,
             message: source.to_string(),
         })?;
@@ -442,14 +430,14 @@ mod tests {
     #[test]
     #[ignore] // needs the bridge DLL plus its TensorRT/CUDA dependencies reachable
     fn load_default_resolves_every_symbol() {
-        let bridge = Bridge::load_default().expect("bridge DLL should load");
+        let bridge = Bridge::load_default_backend().expect("bridge DLL should load");
         assert!(bridge.path.exists());
     }
 
     #[test]
     fn missing_dll_reports_bridge_load() {
         let err = Bridge::load("definitely-not-there.dll").unwrap_err();
-        assert!(matches!(err, InferError::BridgeLoad { .. }));
+        assert!(matches!(err, EngineError::BridgeLoad { .. }));
     }
 
     #[test]
