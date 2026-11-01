@@ -11,7 +11,7 @@ use std::env;
 use std::path::PathBuf;
 
 /// Name of the CMake target that produces the bridge DLL.
-const DLL_NAME: &str = "infertensorrt_cpp";
+const DLL_NAME: &str = "infertensorrt";
 
 fn main() {
     println!("cargo:rerun-if-changed=cpp/include");
@@ -63,7 +63,6 @@ fn main() {
     );
 
     let candidates = [
-        env::var_os("INFERTENSORRT_BIN_DIR").map(PathBuf::from),
         Some(PathBuf::from("cpp/install/x64-release/bin")),
         Some(PathBuf::from("cpp/build/x64-release/bin")),
         Some(PathBuf::from("cpp/build/bin")),
@@ -113,8 +112,7 @@ fn main() {
             println!(
                 "cargo:warning={file_name} not found; the crate builds, but loading the \
                  bridge will fail at runtime (install the C++ bridge, e.g. \
-                 `cmake --install cpp/build/x64-release --prefix cpp/install`, or set \
-                 INFERTENSORRT_BIN_DIR)"
+                 `cmake --install cpp/build/x64-release --prefix cpp/install`)"
             );
         }
     }

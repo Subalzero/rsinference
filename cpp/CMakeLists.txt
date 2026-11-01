@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(infertensorrt_cpp VERSION 0.1.0 LANGUAGES C CXX)
+project(rsinference VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,7 +17,7 @@ include(CMakePackageConfigHelpers)
 # ---------------------------------------------------------------------------
 # Options
 # ---------------------------------------------------------------------------
-option(INFERTENSORRT_BUILD_SHARED "Build infertensorrt_cpp as a shared library (DLL)" ON)
+option(INFERTENSORRT_BUILD_SHARED "Build infertensorrt as a shared library (DLL)" ON)
 option(BUILD_EXAMPLES "Build example applications" ON)
 
 if(INFERTENSORRT_BUILD_SHARED)
@@ -47,16 +47,16 @@ file(GLOB_RECURSE INFERTENSORRT_PUBLIC_HEADERS CONFIGURE_DEPENDS
 # A DLL target needs at least one translation unit. Until the first real source
 # is added, build a harmless placeholder so the template configures as-is.
 if(NOT INFERTENSORRT_SOURCES)
-    message(STATUS "infertensorrt_cpp: no sources in src/, using a placeholder TU")
+    message(STATUS "infertensorrt: no sources in src/, using a placeholder TU")
     set(INFERTENSORRT_PLACEHOLDER "${CMAKE_CURRENT_BINARY_DIR}/infertensorrt_placeholder.cpp")
     if(NOT EXISTS "${INFERTENSORRT_PLACEHOLDER}")
         file(WRITE "${INFERTENSORRT_PLACEHOLDER}"
             "// Auto-generated placeholder so the DLL target has a source file\n"
             "// and produces an import library. Add real sources under src/ and\n"
             "// this file is no longer used.\n"
-            "#include \"infertensorrt_cpp/export.h\"\n"
+            "#include \"infertensorrt/export.h\"\n"
             "\n"
-            "extern \"C\" INFERTENSORRT_EXPORT int infertensorrt_cpp_placeholder_anchor(void)\n"
+            "extern \"C\" INFERTENSORRT_EXPORT int infertensorrt_placeholder_anchor(void)\n"
             "{\n"
             "    return 0;\n"
             "}\n")
@@ -84,9 +84,10 @@ endif()
 # ----------------------------------------------------------------------------
 # Required dependencies
 # ----------------------------------------------------------------------------
-find_package(OpenCV REQUIRED)
+find_package(OpenCV CONFIG REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(GTest REQUIRED)
+find_package(nlohmann_json)
 
 # Prefer CUDAToolkit over the deprecated FindCUDA module.
 if(DEFINED CUDA_TOOLKIT_ROOT_DIR AND NOT DEFINED CUDAToolkit_ROOT)
@@ -117,15 +118,15 @@ endif()
 # ---------------------------------------------------------------------------
 # Library (DLL on Windows, .so/.dylib elsewhere)
 # ---------------------------------------------------------------------------
-add_library(infertensorrt_cpp ${INFERTENSORRT_LIBRARY_TYPE})
-add_library(infertensorrt::infertensorrt_cpp ALIAS infertensorrt_cpp)
+add_library(infertensorrt ${INFERTENSORRT_LIBRARY_TYPE})
+add_library(infertensorrt::infertensorrt ALIAS infertensorrt)
 
-target_sources(infertensorrt_cpp PRIVATE
+target_sources(infertensorrt PRIVATE
     ${INFERTENSORRT_SOURCES}
     ${TRT_SAMPLES_SOURCES}
 )
 
-target_include_directories(infertensorrt_cpp
+target_include_directories(infertensorrt
     PUBLIC
         "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
         "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>"
@@ -140,17 +141,18 @@ target_include_directories(infertensorrt_cpp
         "${TRT_SAMPLES_DIR}"
 )
 
-target_link_libraries(infertensorrt_cpp
+target_link_libraries(infertensorrt
     PRIVATE
         CUDA::cudart
+        nlohmann_json::nlohmann_json
 )
 
 # Enable the ONNX parser parts of the TensorRT sample headers
 # (parserOnnxConfig.h / sampleEntrypoints.h are guarded by this macro).
-target_compile_definitions(infertensorrt_cpp PRIVATE TRT_BUILD_ONNX_PARSER=1)
+target_compile_definitions(infertensorrt PRIVATE TRT_BUILD_ONNX_PARSER=1)
 
 if(TENSORRT_DIR)
-    target_include_directories(infertensorrt_cpp PRIVATE "${TENSORRT_DIR}/include")
+    target_include_directories(infertensorrt PRIVATE "${TENSORRT_DIR}/include")
 
     # Kept in a variable so sample executables can link the same libraries.
     set(INFERTENSORRT_TRT_LIBRARIES)
@@ -173,23 +175,23 @@ if(TENSORRT_DIR)
         endif()
     endforeach()
 
-    target_link_libraries(infertensorrt_cpp PRIVATE ${INFERTENSORRT_TRT_LIBRARIES})
+    target_link_libraries(infertensorrt PRIVATE ${INFERTENSORRT_TRT_LIBRARIES})
 endif()
 
-set_target_properties(infertensorrt_cpp PROPERTIES
+set_target_properties(infertensorrt PROPERTIES
     VERSION ${PROJECT_VERSION}
     SOVERSION ${PROJECT_VERSION_MAJOR}
     # Keep the DLL/import-library name stable for downstream consumers.
-    OUTPUT_NAME "infertensorrt_cpp"
+    OUTPUT_NAME "infertensorrt"
 )
 
-# Generates include/infertensorrt_cpp/export.h (build tree) with
+# Generates include/infertensorrt/export.h (build tree) with
 # INFERTENSORRT_EXPORT / INFERTENSORRT_NO_EXPORT macros. Annotate every public
 # function or class you want visible from the DLL with INFERTENSORRT_EXPORT.
-generate_export_header(infertensorrt_cpp
+generate_export_header(infertensorrt
     BASE_NAME INFERTENSORRT
     EXPORT_MACRO_NAME INFERTENSORRT_EXPORT
-    EXPORT_FILE_NAME "${CMAKE_CURRENT_BINARY_DIR}/include/infertensorrt_cpp/export.h"
+    EXPORT_FILE_NAME "${CMAKE_CURRENT_BINARY_DIR}/include/infertensorrt/export.h"
 )
 
 # ---------------------------------------------------------------------------
@@ -200,16 +202,16 @@ function(infertensorrt_copy_runtime target)
     if(WIN32 AND INFERTENSORRT_BUILD_SHARED)
         add_custom_command(TARGET ${target} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "$<TARGET_FILE:infertensorrt_cpp>"
+                "$<TARGET_FILE:infertensorrt>"
                 "$<TARGET_FILE_DIR:${target}>"
             VERBATIM)
     endif()
 endfunction()
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
-    add_executable(infertensorrt_cpp_app src/main.cpp)
-    target_link_libraries(infertensorrt_cpp_app PRIVATE infertensorrt_cpp)
-    infertensorrt_copy_runtime(infertensorrt_cpp_app)
+    add_executable(infertensorrt_app src/main.cpp)
+    target_link_libraries(infertensorrt_app PRIVATE infertensorrt)
+    infertensorrt_copy_runtime(infertensorrt_app)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -220,7 +222,7 @@ if(BUILD_EXAMPLES)
     foreach(example_src IN LISTS EXAMPLE_SOURCES)
         get_filename_component(example_name "${example_src}" NAME_WE)
         add_executable(${example_name} "${example_src}")
-        target_link_libraries(${example_name} PRIVATE infertensorrt_cpp)
+        target_link_libraries(${example_name} PRIVATE infertensorrt)
         infertensorrt_copy_runtime(${example_name})
     endforeach()
 endif()
@@ -267,15 +269,15 @@ if(BUILD_TESTING)
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp"
     )
     if(INFERTENSORRT_TEST_SOURCES)
-        add_executable(infertensorrt_cpp_tests ${INFERTENSORRT_TEST_SOURCES})
-        target_include_directories(infertensorrt_cpp_tests
+        add_executable(infertensorrt_tests ${INFERTENSORRT_TEST_SOURCES})
+        target_include_directories(infertensorrt_tests
             PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include/public"
         )
-        target_link_libraries(infertensorrt_cpp_tests
-            PRIVATE infertensorrt_cpp GTest::gtest GTest::gtest_main
+        target_link_libraries(infertensorrt_tests
+            PRIVATE infertensorrt GTest::gtest GTest::gtest_main
         )
-        infertensorrt_copy_runtime(infertensorrt_cpp_tests)
-        add_test(NAME rsinference_ffi COMMAND infertensorrt_cpp_tests)
+        infertensorrt_copy_runtime(infertensorrt_tests)
+        add_test(NAME rsinference_ffi COMMAND infertensorrt_tests)
         # The DLL loads nvinfer_11.dll / nvonnxparser_11.dll at start-up; make
         # sure the TensorRT runtime directory is on PATH for the test process.
         if(TENSORRT_DIR)
@@ -289,8 +291,8 @@ endif()
 # ---------------------------------------------------------------------------
 # Install / export
 # ---------------------------------------------------------------------------
-install(TARGETS infertensorrt_cpp
-    EXPORT infertensorrt_cppTargets
+install(TARGETS infertensorrt
+    EXPORT infertensorrtTargets
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -307,24 +309,24 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/include")
 endif()
 
 # Export header is generated, so install it explicitly.
-install(FILES "${CMAKE_CURRENT_BINARY_DIR}/include/infertensorrt_cpp/export.h"
-    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/infertensorrt_cpp"
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/include/infertensorrt/export.h"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/infertensorrt"
 )
 
-set(INFERTENSORRT_CMAKE_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/infertensorrt_cpp")
+set(INFERTENSORRT_CMAKE_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/infertensorrt")
 
 write_basic_package_version_file(
-    "${CMAKE_CURRENT_BINARY_DIR}/infertensorrt_cppConfigVersion.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/infertensorrtConfigVersion.cmake"
     VERSION ${PROJECT_VERSION}
     COMPATIBILITY SameMajorVersion
 )
 
-install(EXPORT infertensorrt_cppTargets
-    FILE infertensorrt_cppConfig.cmake
+install(EXPORT infertensorrtTargets
+    FILE infertensorrtConfig.cmake
     NAMESPACE infertensorrt::
     DESTINATION "${INFERTENSORRT_CMAKE_DIR}"
 )
 
-install(FILES "${CMAKE_CURRENT_BINARY_DIR}/infertensorrt_cppConfigVersion.cmake"
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/infertensorrtConfigVersion.cmake"
     DESTINATION "${INFERTENSORRT_CMAKE_DIR}"
 )

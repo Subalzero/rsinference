@@ -1,6 +1,14 @@
 #include "rsinference.h"
 #include "tensorrtrunner.h"
 
+#include <fstream>
+#include <functional>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include <nlohmann/json.hpp>
+
 enum ErrorCodes
 {
     ERROR_CODE_SUCCESS = 0,
@@ -9,6 +17,90 @@ enum ErrorCodes
     ERROR_CODE_INFERENCE_FAILED = 3,
     ERROR_CODE_UNKNOWN_BACKEND = 4
 };
+
+using json = nlohmann::json;
+
+struct ProfileEntry
+{
+    std::string name;
+    nvinfer1::Dims mn, opt, mx;
+};
+
+static bool to_dims(const json& j, nvinfer1::Dims& d)
+{
+    if (!j.is_array() || j.empty() || j.size() > nvinfer1::Dims::MAX_DIMS) return false;
+    d.nbDims = static_cast<int32_t>(j.size());
+    for (int32_t i = 0; i < d.nbDims; ++i)
+    {
+        if (!j[i].is_number_integer()) return false;
+        d.d[i] = j[i].get<int64_t>();
+    }
+    return true;
+}
+
+// Returns an empty string on success, otherwise a message describing the problem.
+static std::string load_config(const char* path, rsinfer::RunnerParams& params, std::vector<ProfileEntry>& entries)
+{
+    std::ifstream f(path);
+    if (!f.is_open())
+        return "Failed to open config file: " + std::string(path);
+
+    json j = json::parse(f, nullptr, /*allow_exceptions=*/false);
+    if (j.is_discarded() || !j.is_object())
+        return "Config file is not valid JSON: " + std::string(path);
+
+    if (j.contains("n_contexts"))
+    {
+        if (!j["n_contexts"].is_number_integer() || j["n_contexts"].get<int64_t>() < 1)
+            return "n_contexts must be an integer >= 1";
+        params.nContexts = j["n_contexts"].get<uint32_t>();
+    }
+
+    if (j.contains("timing_cache"))
+    {
+        if (!j["timing_cache"].is_string())
+            return "timing_cache must be a string";
+        params.timingCacheFile = j["timing_cache"].get<std::string>();
+    }
+
+    if (j.contains("dla_core"))
+    {
+        if (!j["dla_core"].is_number_integer())
+            return "dla_core must be an integer";
+        params.dlaCore = j["dla_core"].get<int32_t>();
+    }
+
+    if (j.contains("data_dirs"))
+    {
+        if (!j["data_dirs"].is_array())
+            return "data_dirs must be an array of strings";
+        for (const auto& d : j["data_dirs"])
+        {
+            if (!d.is_string())
+                return "data_dirs must be an array of strings";
+            params.dataDirs.push_back(d.get<std::string>());
+        }
+    }
+
+    if (j.contains("profile"))
+    {
+        if (!j["profile"].is_object())
+            return "profile must be an object";
+        for (auto it = j["profile"].begin(); it != j["profile"].end(); ++it)
+        {
+            ProfileEntry e;
+            e.name = it.key();
+            const json& v = it.value();
+            if (!v.is_object() || !v.contains("min") || !v.contains("opt") || !v.contains("max") ||
+                !to_dims(v["min"], e.mn) || !to_dims(v["opt"], e.opt) || !to_dims(v["max"], e.mx))
+                return "Bad profile entry for tensor: " + e.name;
+            entries.push_back(std::move(e));
+        }
+    }
+
+    params.dynamic = !entries.empty();
+    return {};
+}
 
 RSInferenceRunner* rs_inference_runner_create(const char* model_path, const char* config_path, RSInferError* error)
 {
@@ -22,46 +114,70 @@ RSInferenceRunner* rs_inference_runner_create(const char* model_path, const char
         return nullptr;
     }
 
+    // Declared outside the try so the catch block can free them.
+    RSInferenceRunner* runner = nullptr;
+    rsinfer::TensorRTRunner* tensorrtrunner = nullptr;
+
     try
     {
         rsinfer::RunnerParams params;
         params.onnxFileName = model_path;
+
+        std::vector<ProfileEntry> entries;
         if (config_path)
         {
-            std::ifstream config_file(config_path);
-            if (!config_file.is_open())
+            std::string msg = load_config(config_path, params, entries);
+            if (!msg.empty())
             {
-                error->code = ERROR_CODE_INVALID_ARGUMENTS;
-                error->message = strdup(("Failed to open config file: " + std::string(config_path)).c_str());
+                if (error)
+                {
+                    error->code = ERROR_CODE_INVALID_ARGUMENTS;
+                    error->message = strdup(msg.c_str());
+                }
                 return nullptr;
-            }
-            std::string line;
-            while (std::getline(config_file, line))
-            {
-                // Parse the config file and set parameters accordingly
-                // For example, you can parse lines like "batchSize=4" and set params.batchSize = 4
-                // Implement your own parsing logic here based on your config file format
             }
         }
 
-        RSInferenceRunner* runner = (RSInferenceRunner*)malloc(sizeof(RSInferenceRunner));
+        runner = (RSInferenceRunner*)malloc(sizeof(RSInferenceRunner));
         if (!runner)
         {
-            error->code = ERROR_CODE_CREATION_FAILED;
-            error->message = strdup("Failed to allocate memory for RSInferenceRunner");
+            if (error)
+            {
+                error->code = ERROR_CODE_CREATION_FAILED;
+                error->message = strdup("Failed to allocate memory for RSInferenceRunner");
+            }
             return nullptr;
         }
 
-        auto tensorrtrunner = new rsinfer::TensorRTRunner(params);
+        tensorrtrunner = new rsinfer::TensorRTRunner(params);
         runner->runner = static_cast<void*>(tensorrtrunner);
         runner->backend = RSInferenceBackend_TensorRT;
 
-        if (!tensorrtrunner->build())
+        std::function<bool(nvinfer1::IOptimizationProfile*)> profile_cb;
+        if (!entries.empty())
+        {
+            profile_cb = [&entries](nvinfer1::IOptimizationProfile* p)
+            {
+                for (const auto& e : entries)
+                {
+                    if (!p->setDimensions(e.name.c_str(), nvinfer1::OptProfileSelector::kMIN, e.mn) ||
+                        !p->setDimensions(e.name.c_str(), nvinfer1::OptProfileSelector::kOPT, e.opt) ||
+                        !p->setDimensions(e.name.c_str(), nvinfer1::OptProfileSelector::kMAX, e.mx))
+                        return false;
+                }
+                return true;
+            };
+        }
+
+        if (!tensorrtrunner->build(profile_cb))
         {
             delete tensorrtrunner;
             free(runner);
-            error->code = ERROR_CODE_CREATION_FAILED;
-            error->message = strdup("Failed to build the TensorRT engine");
+            if (error)
+            {
+                error->code = ERROR_CODE_CREATION_FAILED;
+                error->message = strdup("Failed to build the TensorRT engine");
+            }
             return nullptr;
         }
 
@@ -69,6 +185,8 @@ RSInferenceRunner* rs_inference_runner_create(const char* model_path, const char
     }
     catch (const std::exception& e)
     {
+        delete tensorrtrunner; // deleting nullptr is a no-op
+        free(runner);
         if (error)
         {
             error->code = ERROR_CODE_CREATION_FAILED;
@@ -259,7 +377,8 @@ RSInferTensorArray* rs_inference_runner_get_results(RSInferenceRunner* runner, R
                 rs_infer_tensorarray_destroy(output_array);
                 return nullptr;
             }
-            memcpy(shape_array->data, tensor.shape.data(), tensor.shape.size());
+            for (size_t d = 0; d < tensor.shape.size(); ++d)
+                shape_array->data[d] = static_cast<long long>(tensor.shape[d]);
             output_array->tensors[i] = rs_infer_tensor_create(tensor.name.c_str(), tensor.name.size(), static_cast<RSInferDataType>(tensor.dtype), data_array, shape_array);
             if (!output_array->tensors[i])
             {

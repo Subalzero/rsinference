@@ -1,25 +1,7 @@
-use std::fmt;
-
 use crate::ffi::{RSInferIntArray, RSInferLLArray, RSInferTensor};
 use crate::error::{DataResult};
 
-impl fmt::Display for Shape {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let dims = self
-            .dims
-            .iter()
-            .map(|d| d.to_string())
-            .collect::<Vec<_>>()
-            .join("x");
-        write!(f, "{}", dims)
-    }
-}
-
-/// Tensor shape: dimensions in row-major order, plus element kind.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Shape {
-    pub dims: Vec<u64>,
-}
+pub type Shape = Vec<u64>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Default, Ord, Hash)]
 pub enum Dtype {
@@ -82,34 +64,6 @@ impl Dtype {
     }
 }
 
-impl Shape {
-    /// Changes the c object to Rust object Shape
-    /// Make sure to check if the input is not null
-    pub unsafe fn from_rs_infer_int_array_ptr(rs_array: &*mut RSInferIntArray) -> DataResult<Self> {
-        let rs_int_arr_ref = unsafe { &**rs_array };
-        let dims = unsafe { std::slice::from_raw_parts(rs_int_arr_ref.data, rs_int_arr_ref.length as usize) }
-            .iter()
-            .map(|&d| d as u64)
-            .collect::<Vec<_>>();
-        Ok(Shape {
-            dims,
-        })
-    }
-
-    /// Changes the c object to Rust object Shape
-    /// Make sure to check if the input is not null
-    pub unsafe fn from_rs_infer_ll_array_ptr(rs_array: &*mut RSInferLLArray) -> DataResult<Self> {
-        let rs_int_arr_ref = unsafe { &**rs_array };
-        let dims = unsafe { std::slice::from_raw_parts(rs_int_arr_ref.data, rs_int_arr_ref.length as usize) }
-            .iter()
-            .map(|&d| d as u64)
-            .collect::<Vec<_>>();
-        Ok(Shape {
-            dims,
-        })
-    }
-}
-
 impl Tensor {
     /// Changes the c object to Rust object Tensor
     /// Make sure to check if the input is not null
@@ -121,9 +75,29 @@ impl Tensor {
             tensor.name = std::ffi::CStr::from_ptr(rs_tensor_ref.name)
                 .to_string_lossy()
                 .into_owned();
-            tensor.shape = Shape::from_rs_infer_ll_array_ptr(&rs_tensor_ref.shape)?;
+            tensor.shape = from_rs_infer_ll_array_ptr(&rs_tensor_ref.shape)?;
             tensor.dtype = Dtype::from_c_int(rs_tensor_ref.dtype);
         }
         Ok(tensor)
     }
 }
+
+pub unsafe fn from_rs_infer_int_array_ptr(rs_array: &*mut RSInferIntArray) -> DataResult<Shape> {
+        let rs_int_arr_ref = unsafe { &**rs_array };
+        let dims = unsafe { std::slice::from_raw_parts(rs_int_arr_ref.data, rs_int_arr_ref.length as usize) }
+            .iter()
+            .map(|&d| d as u64)
+            .collect::<Vec<_>>();
+        Ok(dims)
+    }
+
+    /// Changes the c object to Rust object Shape
+    /// Make sure to check if the input is not null
+    pub unsafe fn from_rs_infer_ll_array_ptr(rs_array: &*mut RSInferLLArray) -> DataResult<Shape> {
+        let rs_int_arr_ref = unsafe { &**rs_array };
+        let dims = unsafe { std::slice::from_raw_parts(rs_int_arr_ref.data, rs_int_arr_ref.length as usize) }
+            .iter()
+            .map(|&d| d as u64)
+            .collect::<Vec<_>>();
+        Ok(dims)
+    }

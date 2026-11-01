@@ -300,7 +300,7 @@ impl InferInstance<'_> {
             return Err(error);
         }
 
-        let shape_result = unsafe { Shape::from_rs_infer_int_array_ptr(&shape_ptr) };
+        let shape_result = unsafe { from_rs_infer_int_array_ptr(&shape_ptr) };
 
         // The C++ side allocated this with rs_infer_intarray_create; free it
         // whether or not the conversion succeeded.
@@ -332,7 +332,7 @@ impl InferInstance<'_> {
             return Err(error);
         }
 
-        let shape_result = unsafe { Shape::from_rs_infer_int_array_ptr(&shape_ptr) };
+        let shape_result = unsafe { from_rs_infer_int_array_ptr(&shape_ptr) };
 
         // The C++ side allocated this with rs_infer_intarray_create; free it
         // whether or not the conversion succeeded.
@@ -355,7 +355,7 @@ impl InferInstance<'_> {
         // Convert dtype to c equivalent
         let dtype_c = tensor.dtype as c_int;
         // Convert shape to c equivalent
-        let shape_len = tensor.shape.dims.len();
+        let shape_len = tensor.shape.len();
         let rs_ll_arr_ptr = unsafe { (self.engine.bridge.llarray_create)(shape_len) };
         if rs_ll_arr_ptr.is_null() {
             return Err(InferError::Backend { message: "llarray_create returned null".to_string() })
@@ -363,7 +363,7 @@ impl InferInstance<'_> {
 
         // populate the llarray
         let ll_slice = unsafe { std::slice::from_raw_parts_mut((*rs_ll_arr_ptr).data, shape_len) };
-        for (item, dim) in ll_slice.iter_mut().zip(tensor.shape.dims.iter()) {
+        for (item, dim) in ll_slice.iter_mut().zip(tensor.shape.iter()) {
             *item = dim.clone() as i64;
         }
 
@@ -422,7 +422,7 @@ impl Engine {
         })
     }
 
-    pub fn create_infer_instance(&self, model_path: &PathBuf) -> EngineResult<InferInstance<'_>> {
+    pub fn create_infer_instance(&self, model_path: &PathBuf, config_path: Option<&PathBuf>) -> EngineResult<InferInstance<'_>> {
 
         let metadata = std::fs::metadata(&model_path).map_err(|source| EngineError::Load {
             path: model_path.display().to_string(),
@@ -443,7 +443,7 @@ impl Engine {
         let runner = unsafe {
             (self.bridge.runner_create)(
                 model_path.to_str().unwrap().as_ptr() as *const i8,
-                ptr::null(), // config_path: no config file
+                config_path.map_or(ptr::null(), |p| p.to_str().unwrap().as_ptr() as *const i8),
                 &mut error,
             )
         };
@@ -491,8 +491,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn load_missing_engine_reports_error() {
-        let err = Engine::load(EngineType::TensorRT).unwrap_err();
+    fn load_missing_model_reports_error() {
+        let engine = Engine::load(EngineType::TensorRT).unwrap();
+        let err = engine.create_infer_instance(&PathBuf::from("nonexistent.engine"), None).unwrap_err();
         assert!(matches!(err, EngineError::Load { .. }));
     }
 
@@ -500,5 +501,13 @@ mod tests {
     fn unimplemented_backend_is_reported() {
         let err = Engine::load(EngineType::ONNX).unwrap_err();
         assert!(matches!(err, EngineError::UnsupportedBackend { .. }));
+    }
+
+    #[test]
+    fn load_existing_model_succeeds() {
+        let engine = Engine::load(EngineType::TensorRT).unwrap();
+        let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/version-RFB-640.onnx");
+        let instance = engine.create_infer_instance(&model_path, None).unwrap();
+        assert_eq!(instance.model_path(), &model_path);
     }
 }

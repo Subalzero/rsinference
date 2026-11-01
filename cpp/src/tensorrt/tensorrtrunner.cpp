@@ -1,3 +1,5 @@
+#include <stdexcept>
+
 #include "tensorrtrunner.h"
 
 #include <cassert>
@@ -26,6 +28,18 @@ namespace rsinfer
 			case nvinfer1::DataType::kFP4:   return rsinfer::DataType::FP4;
 			default:                         return rsinfer::DataType::UNKNOWN;
 			}
+		}
+
+		//! "<model>.engine" for static builds, "<model>.dynamic.engine" for dynamic ones.
+		//! Splits at the last '.', not the first, so "./models/foo.onnx" works.
+		std::string engine_path_for(const std::string& onnx_file, bool dynamic)
+		{
+			const auto slash = onnx_file.find_last_of("/\\");
+			const auto dot = onnx_file.rfind('.');
+			const std::string base = (dot == std::string::npos || (slash != std::string::npos && dot < slash))
+				? onnx_file
+				: onnx_file.substr(0, dot);
+			return base + (dynamic ? ".dynamic.engine" : ".engine");
 		}
 	} // namespace
 
@@ -174,11 +188,21 @@ namespace rsinfer
 			}
 		}
 
+		if (_params.nContexts == 0)
+		{
+			return false;
+		}
+
 		uint32_t nireq = _params.nContexts;
 		for (uint32_t i = 0; i < nireq; ++i)
 		{
-			_execution_contexts.emplace_back(_engine->createExecutionContext());
-			_idle_contexts.push(_execution_contexts[i].get());
+			nvinfer1::IExecutionContext* ctx = _engine->createExecutionContext();
+			if (!ctx)
+			{
+				return false;
+			}
+			_execution_contexts.emplace_back(ctx);
+			_idle_contexts.push(ctx);
 		}
 
 		return true;
@@ -186,16 +210,48 @@ namespace rsinfer
 
 	void TensorRTRunner::process(const std::vector<Tensor>& input_tensors)
 	{
-		// Create RAII buffer manager object
-		std::unique_lock<std::mutex> engine_lock(_engine_mut);
-		samplesCommon::BufferManager buffers(_engine);
-		engine_lock.unlock();
-
 		std::unique_lock<std::mutex> idle_context_lock(_idle_contexts_mut);
 		_idle_contexts_cond.wait(idle_context_lock, [&]() { return !_idle_contexts.empty(); });
 		nvinfer1::IExecutionContext* context = _idle_contexts.front();
 		_idle_contexts.pop();
 		idle_context_lock.unlock();
+
+		// Give the context back on every exit path, including exceptions.
+		struct ContextReturn
+		{
+			TensorRTRunner* self;
+			nvinfer1::IExecutionContext* ctx;
+			~ContextReturn()
+			{
+				std::lock_guard<std::mutex> lock(self->_idle_contexts_mut);
+				self->_idle_contexts.push(ctx);
+				self->_idle_contexts_cond.notify_one();
+			}
+		} context_return{ this, context };
+
+		// Resolve dynamic dimensions before any buffer is sized.
+		for (const auto& t : input_tensors)
+		{
+			std::vector<int> shape;
+			shape.reserve(t.shape.size());
+			for (auto dim : t.shape)
+			{
+				shape.push_back(static_cast<int>(dim));
+			}
+			if (!context->setInputShape(t.name.c_str(), vector_to_dims(shape)))
+			{
+				throw std::runtime_error("setInputShape failed for tensor: " + t.name);
+			}
+		}
+		if (!context->allInputDimensionsSpecified())
+		{
+			throw std::runtime_error("Not all input dimensions were specified");
+		}
+
+		// Create RAII buffer manager object, sized from the context's resolved shapes.
+		std::unique_lock<std::mutex> engine_lock(_engine_mut);
+		samplesCommon::BufferManager buffers(_engine, 0, context);
+		engine_lock.unlock();
 
 		for (int32_t i = 0, e = _engine->getNbIOTensors(); i < e; i++)
 		{
@@ -208,27 +264,12 @@ namespace rsinfer
 		// Memcpy from host input buffers to device input buffers
 		buffers.copyInputToDevice();
 
-		std::unique_lock<std::mutex> busy_contexts_lock(_busy_contexts_mut);
-		_busy_contexts.push(context);
-		_busy_contexts_cond.notify_one();
-		busy_contexts_lock.unlock();
-
 		context->executeV2(buffers.getDeviceBindings().data());
 
 		// Memcpy from device output buffers to host output buffers
 		buffers.copyOutputToHost();
 
 		verify_output(buffers, context);
-
-		busy_contexts_lock.lock();
-		_busy_contexts_cond.wait(busy_contexts_lock, [&]() { return !_busy_contexts.empty(); });
-		_busy_contexts.pop();
-		busy_contexts_lock.unlock();
-
-		idle_context_lock.lock();
-		_idle_contexts.push(context);
-		_idle_contexts_cond.notify_one();
-		idle_context_lock.unlock();
 	}
 
 	void TensorRTRunner::process_async(const std::vector<Tensor>& input_tensors)
@@ -420,11 +461,14 @@ namespace rsinfer
 		return true;
 	}
 
-	bool TensorRTRunner::process_input(const samplesCommon::BufferManager& buffers, nvinfer1::IExecutionContext* context, const std::vector<Tensor>& tensors)
+		bool TensorRTRunner::process_input(const samplesCommon::BufferManager& buffers, nvinfer1::IExecutionContext* context, const std::vector<Tensor>& tensors)
 	{
 		auto n_inputs = get_number_of_inputs();
 		std::size_t count = tensors.size();
-		assert(count == n_inputs);
+		if (count != n_inputs)
+		{
+			throw std::runtime_error("Expected " + std::to_string(n_inputs) + " input tensors, got " + std::to_string(count));
+		}
 		for (size_t i = 0; i < count; ++i)
 		{
 			auto& tensor = tensors[i];
@@ -445,14 +489,23 @@ namespace rsinfer
 			std::vector<int> input_dims = dims_to_vector(context->getTensorShape(tensor_name.c_str()));
 			for (size_t d = 0; d < input_dims.size(); ++d)
 			{
-				assert(input_dims[d] != -1);
+				if (input_dims[d] < 0)
+				{
+					throw std::runtime_error("Unresolved dynamic dimension in tensor: " + tensor_name);
+				}
 				input_size *= input_dims[d];
+			}
+
+			const size_t nbytes = samplesCommon::getNbBytes(engine_data_type, static_cast<int64_t>(input_size));
+			if (tensor.data.size() < nbytes)
+			{
+				throw std::runtime_error("Input tensor '" + tensor_name + "' has " + std::to_string(tensor.data.size())
+					+ " bytes, expected " + std::to_string(nbytes));
 			}
 
 			auto hostDataBuffer = buffers.getHostBuffer(get_input_tensor_name(static_cast<uint32_t>(i)));
 
-			memcpy(hostDataBuffer, tensor.data.data(),
-				samplesCommon::getNbBytes(engine_data_type, static_cast<int64_t>(input_size)));
+			memcpy(hostDataBuffer, tensor.data.data(), nbytes);
 		}
 
 		return true;
@@ -492,13 +545,9 @@ namespace rsinfer
 	}
 
 	bool TensorRTRunner::load_engine(std::vector<char>& data) {
-		std::istringstream stream(_params.onnxFileName);
-		std::string file_name;
-		std::getline(stream, file_name, '.');
-		std::string engineFilePath = file_name + ".engine";
+		std::string engineFilePath = engine_path_for(_params.onnxFileName, _params.dynamic);
 		std::ifstream file(engineFilePath, std::ios::binary);
 		if (!file) {
-			//throw std::runtime_error("Could not open engine file: " + engineFilePath);
 			sample::gLogWarning << "Could not open engine file: " + engineFilePath << std::endl;
 			sample::gLogInfo << "Will attempt to create engine file from .onnx model." << std::endl;
 			return false;
@@ -518,10 +567,7 @@ namespace rsinfer
 
 	bool TensorRTRunner::save_engine_to_plan_file(nvinfer1::IHostMemory* plan)
 	{
-		std::istringstream stream(_params.onnxFileName);
-		std::string file_name;
-		std::getline(stream, file_name, '.');
-		std::string planFilePath = file_name + ".engine";
+		std::string planFilePath = engine_path_for(_params.onnxFileName, _params.dynamic);
 		std::ofstream planFile(planFilePath, std::ios::binary);
 		planFile.write(reinterpret_cast<const char*>(plan->data()), plan->size());
 		planFile.close();
