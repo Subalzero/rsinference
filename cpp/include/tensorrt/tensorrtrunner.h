@@ -87,6 +87,10 @@ namespace rsinfer
         std::condition_variable _busy_contexts_cond;
         std::condition_variable _inference_results_cond;
 
+        int _inflight = 0;
+        std::mutex _inflight_mut;
+        std::condition_variable _inflight_cond;
+
         bool construct_network(std::unique_ptr<nvinfer1::IBuilder>& builder, std::unique_ptr<nvinfer1::INetworkDefinition>& network, std::unique_ptr<nvinfer1::IBuilderConfig>& config,
             std::unique_ptr<nvonnxparser::IParser>& parser, std::unique_ptr<nvinfer1::ITimingCache>& timingCache);
 

@@ -36,7 +36,9 @@ namespace rsinfer
 
 	TensorRTRunner::~TensorRTRunner()
 	{
-
+		// Wait for detached process_async threads, which still use `this`.
+		std::unique_lock<std::mutex> lock(_inflight_mut);
+		_inflight_cond.wait(lock, [&]() { return _inflight == 0; });
 	}
 
 	TensorRTRunner::TensorRTRunner(const RunnerParams& params) :
@@ -80,16 +82,10 @@ namespace rsinfer
 		if (load_engine(plan_data))
 		{
 			_runtime = std::shared_ptr<nvinfer1::IRuntime>(createInferRuntime(sample::gLogger.getTRTLogger()));
-			if (!_runtime)
+			if (_runtime)
 			{
-				load_engine_success = false;
-			}
-
-			_engine = std::shared_ptr<nvinfer1::ICudaEngine>(
-				_runtime->deserializeCudaEngine(plan_data.data(), plan_data.size()));
-			if (!_engine)
-			{
-				load_engine_success = false;
+				_engine = std::shared_ptr<nvinfer1::ICudaEngine>(
+					_runtime->deserializeCudaEngine(plan_data.data(), plan_data.size()));
 			}
 
 			if (_runtime && _engine)
@@ -237,7 +233,30 @@ namespace rsinfer
 
 	void TensorRTRunner::process_async(const std::vector<Tensor>& input_tensors)
 	{
-		std::thread(&TensorRTRunner::process, this, input_tensors).detach();
+		{
+			std::lock_guard<std::mutex> lock(_inflight_mut);
+			++_inflight;
+		}
+
+		std::thread([this](std::vector<Tensor> inputs)
+		{
+			try
+			{
+				process(inputs);
+			}
+			catch (const std::exception& e)
+			{
+				sample::gLogError << "process_async failed: " << e.what() << std::endl;
+			}
+			catch (...)
+			{
+				sample::gLogError << "process_async failed: unknown error" << std::endl;
+			}
+
+			std::lock_guard<std::mutex> lock(_inflight_mut);
+			--_inflight;
+			_inflight_cond.notify_all();
+		}, input_tensors).detach();
 	}
 
 	void TensorRTRunner::get(std::vector<Tensor>& result)
