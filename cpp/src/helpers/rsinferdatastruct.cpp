@@ -3,6 +3,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+unsigned int rs_inference_abi_version(void)
+{
+    return RSINFERENCE_ABI_VERSION;
+}
+
 RSInferLLArray* rs_infer_llarray_create(size_t length)
 {
     RSInferLLArray* array = (RSInferLLArray*)malloc(sizeof(RSInferLLArray));

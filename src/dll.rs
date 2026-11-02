@@ -126,6 +126,9 @@ type FnIntarrayCreate = unsafe extern "C" fn(length: usize) -> *mut ffi::RSInfer
 type FnIntarrayDestroy = unsafe extern "C" fn(array: *mut ffi::RSInferIntArray);
 
 type FnErrorCleanmsg = unsafe extern "C" fn(error: *mut ffi::RSInferError);
+type FnAbiVersion = unsafe extern "C" fn() -> u32;
+
+const SUPPORTED_BRIDGE_ABI_VERSION: u32 = 1;
 
 type FnTensorCreate = unsafe extern "C" fn(
     name: *const c_char,
@@ -270,6 +273,15 @@ impl Bridge {
 
         let display = display.as_str();
         unsafe {
+            let abi_version: FnAbiVersion = lookup(&lib, b"rs_inference_abi_version", display)?;
+            let actual_abi_version = abi_version();
+            if actual_abi_version != SUPPORTED_BRIDGE_ABI_VERSION {
+                return Err(EngineError::BridgeAbiMismatch {
+                    path: display.to_string(),
+                    expected: SUPPORTED_BRIDGE_ABI_VERSION,
+                    actual: actual_abi_version,
+                });
+            }
             Ok(Self {
                 llarray_create: lookup(&lib, b"rs_infer_llarray_create", display)?,
                 llarray_destroy: lookup(&lib, b"rs_infer_llarray_destroy", display)?,

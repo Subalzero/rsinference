@@ -8,12 +8,22 @@ extern "C" {
 #include <stddef.h>
 
 #ifdef _WIN32
-    #define BACKEND_EXPORT __declspec(dllexport)
+    #if defined(INFERTENSORRT_STATIC)
+        #define BACKEND_EXPORT
+    #elif defined(INFERTENSORRT_BUILD)
+        #define BACKEND_EXPORT __declspec(dllexport)
+    #else
+        #define BACKEND_EXPORT __declspec(dllimport)
+    #endif
 #else
     #define BACKEND_EXPORT __attribute__((visibility("default")))
 #endif
 
-typedef struct _llarray {
+// Increment when a change alters public struct layout or function contracts.
+#define RSINFERENCE_ABI_VERSION 1u
+BACKEND_EXPORT unsigned int rs_inference_abi_version(void);
+
+typedef struct RSInferLLArray {
     long long* data;
     size_t length;
 } RSInferLLArray;
@@ -22,7 +32,7 @@ typedef struct _llarray {
 BACKEND_EXPORT RSInferLLArray* rs_infer_llarray_create(size_t length);
 BACKEND_EXPORT void rs_infer_llarray_destroy(RSInferLLArray* array);
 
-typedef struct _fparray {
+typedef struct RSInferFPArray {
     float* data;
     size_t length;
 } RSInferFPArray;
@@ -31,7 +41,7 @@ typedef struct _fparray {
 BACKEND_EXPORT RSInferFPArray* rs_infer_fparray_create(size_t length);
 BACKEND_EXPORT void rs_infer_fparray_destroy(RSInferFPArray* array);
 
-typedef struct _uchararray {
+typedef struct RSInferUCharArray {
     unsigned char* data;
     size_t length;
 } RSInferUCharArray;
@@ -40,7 +50,7 @@ typedef struct _uchararray {
 BACKEND_EXPORT RSInferUCharArray* rs_infer_uchararray_create(size_t length);
 BACKEND_EXPORT void rs_infer_uchararray_destroy(RSInferUCharArray* array);
 
-typedef struct _intarray {
+typedef struct RSInferIntArray {
     int* data;
     size_t length;
 } RSInferIntArray;
@@ -49,12 +59,13 @@ typedef struct _intarray {
 BACKEND_EXPORT RSInferIntArray* rs_infer_intarray_create(size_t length);
 BACKEND_EXPORT void rs_infer_intarray_destroy(RSInferIntArray* array);
 
-typedef struct _rsinfer_error {
-    int code = 0;
-    char* message = NULL;
+typedef struct RSInferError {
+    int code;
+    char* message;
 } RSInferError;
 
-// RSInferError helpers
+// Initialize with {0} before passing to an API call. Release any error message
+// through this helper, then reset the fields before reusing the structure.
 BACKEND_EXPORT void rs_infer_error_cleanmsg(RSInferError* error);
 
 // Frees a string returned by the bridge (for example a tensor name from
@@ -63,7 +74,7 @@ BACKEND_EXPORT void rs_infer_error_cleanmsg(RSInferError* error);
 // different C runtime.
 BACKEND_EXPORT void rs_infer_string_free(const char* string);
 
-enum RSInferDataType {
+typedef enum RSInferDataType {
     RSInferDataType_Float32 = 0,
     RSInferDataType_Int32 = 1,
     RSInferDataType_Int64 = 2,
@@ -76,9 +87,9 @@ enum RSInferDataType {
     RSInferDataType_Int4 = 9,
     RSInferDataType_FP4 = 10,
     RSInferDataType_Unknown = 11
-};
+} RSInferDataType;
 
-typedef struct _tensor {
+typedef struct RSInferTensor {
     char* name;
     size_t name_length;
     RSInferDataType dtype;
@@ -89,7 +100,7 @@ typedef struct _tensor {
 BACKEND_EXPORT RSInferTensor* rs_infer_tensor_create(const char* name, size_t name_length, RSInferDataType dtype, RSInferUCharArray* data, RSInferLLArray* shape);
 BACKEND_EXPORT void rs_infer_tensor_destroy(RSInferTensor* tensor);
 
-typedef struct _tensorarray {
+typedef struct RSInferTensorArray {
     RSInferTensor** tensors;
     size_t length;
 } RSInferTensorArray;
@@ -101,12 +112,12 @@ BACKEND_EXPORT void rs_infer_tensorarray_destroy(RSInferTensorArray* array);
 // ----------------------------------------------------------------------------
 // RSInferenceRunner
 // ----------------------------------------------------------------------------
-enum RSInferenceBackend {
+typedef enum RSInferenceBackend {
     RSInferenceBackend_TensorRT = 0,
     RSInferenceBackend_ONNXRuntime = 1,
     RSInferenceBackend_OpenVINO = 2,
     RSInferenceBackend_OpenCV = 3
-};
+} RSInferenceBackend;
 
 /**
  * RSInferenceRunner is a typedef for a structure that encapsulates an inference runner instance, 
@@ -114,7 +125,7 @@ enum RSInferenceBackend {
  * of type RSInferenceBackend. 
  * This structure is likely used to manage and execute inference tasks in a machine learning context.
  */
-typedef struct _inference_runner {
+typedef struct RSInferenceRunner {
     void* runner; // Pointer to the actual inference runner instance (e.g., TensorRTRunner)
     RSInferenceBackend backend;
 } RSInferenceRunner;

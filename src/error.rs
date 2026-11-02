@@ -14,6 +14,9 @@ pub enum EngineError {
      #[error("failed to load native bridge {path}: {message}")]
     BridgeLoad { path: String, message: String },
 
+    #[error("native bridge {path} has ABI version {actual}; this crate requires version {expected}")]
+    BridgeAbiMismatch { path: String, expected: u32, actual: u32 },
+
     #[error("bridge error: {message}")]
     Engine { message: String },
 }

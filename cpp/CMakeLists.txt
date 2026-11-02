@@ -120,6 +120,11 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(infertensorrt ${INFERTENSORRT_LIBRARY_TYPE})
 add_library(infertensorrt::infertensorrt ALIAS infertensorrt)
+if(INFERTENSORRT_BUILD_SHARED)
+    target_compile_definitions(infertensorrt PRIVATE INFERTENSORRT_BUILD)
+else()
+    target_compile_definitions(infertensorrt PUBLIC INFERTENSORRT_STATIC)
+endif()
 
 target_sources(infertensorrt PRIVATE
     ${INFERTENSORRT_SOURCES}
