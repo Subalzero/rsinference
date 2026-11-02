@@ -57,6 +57,12 @@ typedef struct _rsinfer_error {
 // RSInferError helpers
 BACKEND_EXPORT void rs_infer_error_cleanmsg(RSInferError* error);
 
+// Frees a string returned by the bridge (for example a tensor name from
+// rs_inference_runner_get_input_tensor_name). Strings must be released with
+// this function, not with the host's free(), because the bridge may use a
+// different C runtime.
+BACKEND_EXPORT void rs_infer_string_free(const char* string);
+
 enum RSInferDataType {
     RSInferDataType_Float32 = 0,
     RSInferDataType_Int32 = 1,
@@ -116,18 +122,18 @@ typedef struct _inference_runner {
 /**
  * Creates an RSInferenceRunner instance based on the provided model and configuration paths.
  * @param model_path: Path to the model file (e.g., ONNX, TensorRT engine).
- * @param config_path: Path to the configuration file (if applicable).
+ * @param json_config_str: JSON string containing the configuration (if applicable).
  * @param error: Pointer to an RSInferError structure to capture any errors during creation.
  * @return Pointer to the created RSInferenceRunner instance, or nullptr if creation fails.
  * 
  * @attention Implementation Note: This function is called by the Rust engine to create an inference runner.
  * In creating your own inference runner, you should implement this function to initialize the runner 
  * based on the specified model and configuration.
- * DO NOT CONSUME or FREE the model_path, config_path, or error parameter; they are managed by the Rust side. 
+ * DO NOT CONSUME or FREE the model_path, json_config_str, or error parameter; they are managed by the Rust side. 
  * You should only populate the error parameter with error information if needed.
  * THIS FUNCTION MUST BE THREAD-SAFE: It may be called from multiple threads concurrently, so ensure that your implementation is safe for concurrent execution.
  */
-BACKEND_EXPORT RSInferenceRunner* rs_inference_runner_create(const char* model_path, const char* config_path, RSInferError* error);
+BACKEND_EXPORT RSInferenceRunner* rs_inference_runner_create(const char* model_path, const char* json_config_str, RSInferError* error);
 /**
  * Destroys an RSInferenceRunner instance, releasing any associated resources.
  * @param runner: Pointer to the RSInferenceRunner instance to be destroyed.

@@ -17,5 +17,9 @@
         "${env:CUDA_PATH}/include",
         "${env:CUDA_PATH}/include/cccl"
     ],
-    "rust-analyzer.cargo.features": []
+    "rust-analyzer.cargo.features": [],
+    "rust-analyzer.linkedProjects": [
+        "Cargo.toml",
+        "examples/facedetection/Cargo.toml"
+    ]
 }

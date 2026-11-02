@@ -1,0 +1,18 @@
+[package]
+name = "facedetection"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rsinference = { path = "../../" }
+opencv = { version = "0.101", default-features = false, features = [
+    "clang-runtime",
+    "highgui",
+    "imgproc",
+    "videoio",
+] }
+
+[[bin]]
+name = "facedetection"
+path = "src/main.rs"

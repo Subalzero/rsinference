@@ -210,6 +210,26 @@ namespace rsinfer
 
 	void TensorRTRunner::process(const std::vector<Tensor>& input_tensors)
 	{
+		{
+			std::lock_guard<std::mutex> lock(_completions_mut);
+			++_pending_requests;
+		}
+
+		try
+		{
+			process_impl(input_tensors);
+		}
+		catch (...)
+		{
+			finish_request();
+			throw;
+		}
+
+		finish_request();
+	}
+
+	void TensorRTRunner::process_impl(const std::vector<Tensor>& input_tensors)
+	{
 		std::unique_lock<std::mutex> idle_context_lock(_idle_contexts_mut);
 		_idle_contexts_cond.wait(idle_context_lock, [&]() { return !_idle_contexts.empty(); });
 		nvinfer1::IExecutionContext* context = _idle_contexts.front();
@@ -275,37 +295,83 @@ namespace rsinfer
 	void TensorRTRunner::process_async(const std::vector<Tensor>& input_tensors)
 	{
 		{
+			std::lock_guard<std::mutex> lock(_completions_mut);
+			++_pending_requests;
+		}
+		{
 			std::lock_guard<std::mutex> lock(_inflight_mut);
 			++_inflight;
 		}
 
-		std::thread([this](std::vector<Tensor> inputs)
+		try
 		{
-			try
+			std::thread([this](std::vector<Tensor> inputs)
 			{
-				process(inputs);
-			}
-			catch (const std::exception& e)
-			{
-				sample::gLogError << "process_async failed: " << e.what() << std::endl;
-			}
-			catch (...)
-			{
-				sample::gLogError << "process_async failed: unknown error" << std::endl;
-			}
+				try
+				{
+					process_impl(inputs);
+				}
+				catch (const std::exception& e)
+				{
+					{
+						std::lock_guard<std::mutex> lock(_completions_mut);
+						_completions.emplace(std::string(e.what()));
+					}
+					_completions_cond.notify_one();
+					sample::gLogError << "process_async failed: " << e.what() << std::endl;
+				}
+				catch (...)
+				{
+					{
+						std::lock_guard<std::mutex> lock(_completions_mut);
+						_completions.emplace(std::string("unknown asynchronous inference failure"));
+					}
+					_completions_cond.notify_one();
+					sample::gLogError << "process_async failed: unknown error" << std::endl;
+				}
 
+				finish_request();
+
+				std::lock_guard<std::mutex> lock(_inflight_mut);
+				--_inflight;
+				_inflight_cond.notify_all();
+			}, input_tensors).detach();
+		}
+		catch (...)
+		{
+			finish_request();
 			std::lock_guard<std::mutex> lock(_inflight_mut);
 			--_inflight;
 			_inflight_cond.notify_all();
-		}, input_tensors).detach();
+			throw;
+		}
 	}
 
 	void TensorRTRunner::get(std::vector<Tensor>& result)
 	{
-		std::unique_lock<std::mutex> inference_results_lock(_inference_results_mut);
-		_inference_results_cond.wait(inference_results_lock, [&]() { return !_inference_results.empty(); });
-		result = std::move(_inference_results.front());
-		_inference_results.pop();
+		std::unique_lock<std::mutex> completions_lock(_completions_mut);
+		_completions_cond.wait(completions_lock, [&]() {
+			return !_completions.empty() || _pending_requests == 0;
+		});
+		if (_completions.empty())
+			throw std::runtime_error("No inference request is pending");
+
+		Completion completion = std::move(_completions.front());
+		_completions.pop();
+		completions_lock.unlock();
+
+		if (auto* error = std::get_if<std::string>(&completion))
+			throw std::runtime_error(*error);
+		result = std::move(std::get<std::vector<Tensor>>(completion));
+	}
+
+	void TensorRTRunner::finish_request()
+	{
+		{
+			std::lock_guard<std::mutex> lock(_completions_mut);
+			--_pending_requests;
+		}
+		_completions_cond.notify_all();
 	}
 
 	std::vector<int> TensorRTRunner::get_input_shape(uint32_t index) const
@@ -538,9 +604,9 @@ namespace rsinfer
 
 			output_vect.push_back(std::move(out));
 		}
-		std::lock_guard<std::mutex> inference_results_lock(_inference_results_mut);
-		_inference_results.push(std::move(output_vect));
-		_inference_results_cond.notify_one();
+		std::lock_guard<std::mutex> completions_lock(_completions_mut);
+		_completions.emplace(std::move(output_vect));
+		_completions_cond.notify_one();
 		return true;
 	}
 

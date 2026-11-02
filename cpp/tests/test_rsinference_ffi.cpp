@@ -1,5 +1,5 @@
 // Unit tests for the C-compatible FFI layer exported from
-// infertensorrt_cpp.dll (see include/public/rsinference.h).
+// infertensorrt.dll (see include/public/rsinference.h).
 //
 // These tests exercise the exported data-structure helpers and the runner's
 // argument-validation paths, which work without a GPU or an engine file.
@@ -174,15 +174,11 @@ TEST(Tensor, CreateCopiesNameAndAdoptsBuffers)
     rs_infer_tensor_destroy(tensor);
 }
 
-TEST(Tensor, CreateWithNullBuffersIsUsable)
+TEST(Tensor, CreateWithNullBuffersIsRejected)
 {
-    RSInferTensor* tensor =
-        rs_infer_tensor_create("t", 1, RSInferDataType_Int32, nullptr, nullptr);
-    ASSERT_NE(tensor, nullptr);
-    EXPECT_STREQ(tensor->name, "t");
-    EXPECT_EQ(tensor->data, nullptr);
-    EXPECT_EQ(tensor->shape, nullptr);
-    rs_infer_tensor_destroy(tensor);
+    // The tensor owns its data and shape, so null buffers cannot be adopted.
+    EXPECT_EQ(rs_infer_tensor_create("t", 1, RSInferDataType_Int32, nullptr, nullptr),
+              nullptr);
 }
 
 TEST(Tensor, DestroyNullIsNoOp)
@@ -205,8 +201,13 @@ TEST(TensorArray, CreateInitializesFields)
     // Fill both slots with owned tensors, then destroy the array: it must
     // free every tensor it holds.
     for (size_t i = 0; i < array->length; ++i) {
+        RSInferUCharArray* data = rs_infer_uchararray_create(1);
+        RSInferLLArray* shape = rs_infer_llarray_create(1);
+        ASSERT_NE(data, nullptr);
+        ASSERT_NE(shape, nullptr);
+        shape->data[0] = 1;
         array->tensors[i] =
-            rs_infer_tensor_create("x", 1, RSInferDataType_UInt8, nullptr, nullptr);
+            rs_infer_tensor_create("x", 1, RSInferDataType_UInt8, data, shape);
         ASSERT_NE(array->tensors[i], nullptr);
     }
     rs_infer_tensorarray_destroy(array);
@@ -297,7 +298,7 @@ TEST(RunnerEntryPoints, NullTensorNameIsRejected)
 static bool verify_export(const char* name)
 {
     HMODULE dll = LoadLibraryEx(
-        "infertensorrt_cpp.dll",
+        "infertensorrt.dll",
         nullptr,
         LOAD_LIBRARY_SEARCH_SYSTEM32 // prefers the DLL that was already located
     );
@@ -321,6 +322,7 @@ TEST(DynamicLoad, AllHeaderExportsPresentInDll)
         "rs_infer_intarray_create",
         "rs_infer_intarray_destroy",
         "rs_infer_error_cleanmsg",
+        "rs_infer_string_free",
         "rs_infer_tensor_create",
         "rs_infer_tensor_destroy",
         "rs_infer_tensorarray_create",
@@ -342,7 +344,7 @@ TEST(DynamicLoad, AllHeaderExportsPresentInDll)
     for (int i = 0; i < kCount; ++i) {
         const char* sym = expected[i];
         EXPECT_TRUE(verify_export(sym))
-            << "Export '" << sym << "' not found in infertensorrt_cpp.dll";
+            << "Export '" << sym << "' not found in infertensorrt.dll";
     }
 }
 #endif // _WIN32

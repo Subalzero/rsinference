@@ -1,4 +1,4 @@
-//! Runtime loading of the C++ bridge DLL (`infertensorrt_cpp.dll`).
+//! Runtime loading of the C++ bridge DLL (`infertensorrt.dll`).
 //!
 //! The DLL is *not* linked at build time: `build.rs` only generates the type
 //! declarations in `crate::ffi`, and every exported function is resolved here
@@ -174,6 +174,7 @@ type FnRunnerGetTensorName = unsafe extern "C" fn(
     index: c_uint,
     error: *mut ffi::RSInferError,
 ) -> *const c_char;
+type FnStringFree = unsafe extern "C" fn(string: *const c_char);
 
 /// Every exported symbol of the bridge, resolved once at load time.
 ///
@@ -199,6 +200,7 @@ pub struct Bridge {
     pub intarray_destroy: FnIntarrayDestroy,
 
     pub error_cleanmsg: FnErrorCleanmsg,
+    pub string_free: FnStringFree,
 
     pub tensor_create: FnTensorCreate,
     pub tensor_destroy: FnTensorDestroy,
@@ -229,7 +231,7 @@ impl std::fmt::Debug for Bridge {
 }
 
 /// Name of the CMake target that produces the bridge, matching `build.rs`.
-const DLL_NAME: &str = "infertensorrt_cpp";
+const DLL_NAME: &str = "infertensorrt";
 
 /// File name the loader looks for on the current platform.
 fn library_file_name(backend: &str) -> String {
@@ -278,6 +280,7 @@ impl Bridge {
                 intarray_create: lookup(&lib, b"rs_infer_intarray_create", display)?,
                 intarray_destroy: lookup(&lib, b"rs_infer_intarray_destroy", display)?,
                 error_cleanmsg: lookup(&lib, b"rs_infer_error_cleanmsg", display)?,
+                string_free: lookup(&lib, b"rs_infer_string_free", display)?,
                 tensor_create: lookup(&lib, b"rs_infer_tensor_create", display)?,
                 tensor_destroy: lookup(&lib, b"rs_infer_tensor_destroy", display)?,
                 tensorarray_create: lookup(&lib, b"rs_infer_tensorarray_create", display)?,

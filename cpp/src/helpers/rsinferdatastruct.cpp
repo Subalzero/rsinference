@@ -103,6 +103,13 @@ void rs_infer_error_cleanmsg(RSInferError* error)
     }
 }
 
+void rs_infer_string_free(const char* string)
+{
+    if (string) {
+        free((void*)string);
+    }
+}
+
 RSInferTensor* rs_infer_tensor_create(const char* name, size_t name_length, RSInferDataType dtype, RSInferUCharArray* data, RSInferLLArray* shape)
 {
     // `rs_infer_tensor_destroy` takes ownership of `data` and `shape`, so both

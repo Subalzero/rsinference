@@ -62,20 +62,28 @@ fn main() {
         std::env::consts::DLL_SUFFIX
     );
 
-    let candidates = [
-        Some(PathBuf::from("cpp/install/x64-release/bin")),
-        Some(PathBuf::from("cpp/build/x64-release/bin")),
-        Some(PathBuf::from("cpp/build/bin")),
-    ];
+    let mut candidates = Vec::new();
+    if let Ok(dir) = env::var("INFERTENSORRT_BIN_DIR") {
+        candidates.push(PathBuf::from(dir));
+    }
+    candidates.extend([
+        // Default output directory used by the documented Ninja build.
+        PathBuf::from("cpp/build/x64-release"),
+        PathBuf::from("cpp/install/x64-release/bin"),
+        PathBuf::from("cpp/build/x64-release/bin"),
+        PathBuf::from("cpp/build/bin"),
+    ]);
 
     let dll = candidates
         .into_iter()
-        .flatten()
         .map(|dir| dir.join(&file_name))
         .find(|dll| dll.exists());
 
     match dll {
         Some(dll) => {
+            // Re-run (and re-copy) when the bridge is rebuilt.
+            println!("cargo:rerun-if-changed={}", dll.display());
+
             // Copy the bridge next to the built artifacts so
             // `Bridge::load_default` resolves it through the exe directory.
             // `target/<profile>` holds the binaries; `target/<profile>/deps`

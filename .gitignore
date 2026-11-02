@@ -33,3 +33,4 @@ cpp/install
 
 # VSCode
 .vscode
+.cargo

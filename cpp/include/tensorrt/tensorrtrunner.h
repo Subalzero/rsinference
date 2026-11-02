@@ -10,6 +10,7 @@
 
 #include "NvInfer.h"
 #include <cuda_runtime_api.h>
+#include <variant>
 
 namespace rsinfer
 {
@@ -75,21 +76,26 @@ namespace rsinfer
         std::vector<std::unique_ptr<nvinfer1::IExecutionContext>> _execution_contexts;
         std::queue<nvinfer1::IExecutionContext*> _idle_contexts;
         std::queue<nvinfer1::IExecutionContext*> _busy_contexts;
-        std::queue<std::vector<Tensor>> _inference_results;
+        using Completion = std::variant<std::vector<Tensor>, std::string>;
+        std::queue<Completion> _completions;
 
         std::mutex _idle_contexts_mut;
         std::mutex _busy_contexts_mut;
-        std::mutex _inference_results_mut;
+        std::mutex _completions_mut;
 
         std::mutex _engine_mut;
 
         std::condition_variable _idle_contexts_cond;
         std::condition_variable _busy_contexts_cond;
-        std::condition_variable _inference_results_cond;
+        std::condition_variable _completions_cond;
+        size_t _pending_requests{ 0 };
 
         int _inflight = 0;
         std::mutex _inflight_mut;
         std::condition_variable _inflight_cond;
+
+        void process_impl(const std::vector<Tensor>& input_tensors);
+        void finish_request();
 
         bool construct_network(std::unique_ptr<nvinfer1::IBuilder>& builder, std::unique_ptr<nvinfer1::INetworkDefinition>& network, std::unique_ptr<nvinfer1::IBuilderConfig>& config,
             std::unique_ptr<nvonnxparser::IParser>& parser, std::unique_ptr<nvinfer1::ITimingCache>& timingCache);

@@ -20,6 +20,77 @@ enum ErrorCodes
 
 using json = nlohmann::json;
 
+// The public C enum and the C++ rsinfer::DataType enum use different value
+// orders, so they must be translated rather than cast.
+static rsinfer::DataType to_rsinfer_data_type(RSInferDataType dtype)
+{
+    switch (dtype)
+    {
+    case RSInferDataType_Float32: return rsinfer::DataType::FP32;
+    case RSInferDataType_Half:    return rsinfer::DataType::FP16;
+    case RSInferDataType_BF16:    return rsinfer::DataType::BF16;
+    case RSInferDataType_Int4:    return rsinfer::DataType::INT4;
+    case RSInferDataType_FP4:     return rsinfer::DataType::FP4;
+    // The public enum has no signed 8-bit type; UInt8 is the only 8-bit slot.
+    case RSInferDataType_UInt8:   return rsinfer::DataType::INT8;
+    default:                      return rsinfer::DataType::UNKNOWN;
+    }
+}
+
+static RSInferDataType to_public_data_type(rsinfer::DataType dtype)
+{
+    switch (dtype)
+    {
+    case rsinfer::DataType::FP32: return RSInferDataType_Float32;
+    case rsinfer::DataType::FP16: return RSInferDataType_Half;
+    case rsinfer::DataType::BF16: return RSInferDataType_BF16;
+    case rsinfer::DataType::INT8: return RSInferDataType_UInt8;
+    case rsinfer::DataType::INT4: return RSInferDataType_Int4;
+    case rsinfer::DataType::FP4:  return RSInferDataType_FP4;
+    default:                      return RSInferDataType_Unknown;
+    }
+}
+
+static RSInferDataType tensorrt_data_type_to_public(nvinfer1::DataType dtype)
+{
+    switch (dtype)
+    {
+    case nvinfer1::DataType::kFLOAT: return RSInferDataType_Float32;
+    case nvinfer1::DataType::kHALF:  return RSInferDataType_Half;
+    case nvinfer1::DataType::kINT32: return RSInferDataType_Int32;
+    case nvinfer1::DataType::kBOOL:  return RSInferDataType_Bool;
+    case nvinfer1::DataType::kUINT8: return RSInferDataType_UInt8;
+    case nvinfer1::DataType::kFP8:   return RSInferDataType_FP8;
+    case nvinfer1::DataType::kE8M0:  return RSInferDataType_E8M0;
+    case nvinfer1::DataType::kBF16:  return RSInferDataType_BF16;
+    case nvinfer1::DataType::kINT64: return RSInferDataType_Int64;
+    case nvinfer1::DataType::kINT4:  return RSInferDataType_Int4;
+    case nvinfer1::DataType::kFP4:   return RSInferDataType_FP4;
+    // No signed 8-bit slot in the public enum; UInt8 is size-compatible.
+    case nvinfer1::DataType::kINT8:  return RSInferDataType_UInt8;
+    default:                         return RSInferDataType_Unknown;
+    }
+}
+
+static bool public_data_type_to_tensorrt(RSInferDataType dtype, nvinfer1::DataType& result)
+{
+    switch (dtype)
+    {
+    case RSInferDataType_Float32: result = nvinfer1::DataType::kFLOAT; return true;
+    case RSInferDataType_Int32:   result = nvinfer1::DataType::kINT32; return true;
+    case RSInferDataType_Int64:   result = nvinfer1::DataType::kINT64; return true;
+    case RSInferDataType_UInt8:   result = nvinfer1::DataType::kUINT8; return true;
+    case RSInferDataType_Bool:    result = nvinfer1::DataType::kBOOL; return true;
+    case RSInferDataType_Half:    result = nvinfer1::DataType::kHALF; return true;
+    case RSInferDataType_FP8:     result = nvinfer1::DataType::kFP8; return true;
+    case RSInferDataType_E8M0:    result = nvinfer1::DataType::kE8M0; return true;
+    case RSInferDataType_BF16:    result = nvinfer1::DataType::kBF16; return true;
+    case RSInferDataType_Int4:    result = nvinfer1::DataType::kINT4; return true;
+    case RSInferDataType_FP4:     result = nvinfer1::DataType::kFP4; return true;
+    default:                      return false;
+    }
+}
+
 struct ProfileEntry
 {
     std::string name;
@@ -39,15 +110,11 @@ static bool to_dims(const json& j, nvinfer1::Dims& d)
 }
 
 // Returns an empty string on success, otherwise a message describing the problem.
-static std::string load_config(const char* path, rsinfer::RunnerParams& params, std::vector<ProfileEntry>& entries)
+static std::string load_config(const std::string& json_config, rsinfer::RunnerParams& params, std::vector<ProfileEntry>& entries)
 {
-    std::ifstream f(path);
-    if (!f.is_open())
-        return "Failed to open config file: " + std::string(path);
-
-    json j = json::parse(f, nullptr, /*allow_exceptions=*/false);
+    json j = json::parse(json_config, nullptr, /*allow_exceptions=*/false);
     if (j.is_discarded() || !j.is_object())
-        return "Config file is not valid JSON: " + std::string(path);
+        return "json_config_str is not a valid JSON object";
 
     if (j.contains("n_contexts"))
     {
@@ -102,7 +169,7 @@ static std::string load_config(const char* path, rsinfer::RunnerParams& params, 
     return {};
 }
 
-RSInferenceRunner* rs_inference_runner_create(const char* model_path, const char* config_path, RSInferError* error)
+RSInferenceRunner* rs_inference_runner_create(const char* model_path, const char* json_config_str, RSInferError* error)
 {
     if (!model_path)
     {
@@ -122,11 +189,14 @@ RSInferenceRunner* rs_inference_runner_create(const char* model_path, const char
     {
         rsinfer::RunnerParams params;
         params.onnxFileName = model_path;
+        // `locateFile()` requires at least one directory entry. An empty entry
+        // means "use onnxFileName exactly as given", matching the C++ sample.
+        params.dataDirs = { "" };
 
         std::vector<ProfileEntry> entries;
-        if (config_path)
+        if (json_config_str && *json_config_str)
         {
-            std::string msg = load_config(config_path, params, entries);
+            std::string msg = load_config(json_config_str, params, entries);
             if (!msg.empty())
             {
                 if (error)
@@ -246,7 +316,7 @@ int rs_inference_runner_infer(RSInferenceRunner* runner, RSInferTensorArray* inp
             t.name = tensor->name;
             t.shape.assign(tensor->shape->data, tensor->shape->data + tensor->shape->length);
             t.data.assign(tensor->data->data, tensor->data->data + tensor->data->length);
-            t.dtype = static_cast<rsinfer::DataType>(tensor->dtype);
+            t.dtype = to_rsinfer_data_type(tensor->dtype);
             inputs.push_back(std::move(t));
         }
 
@@ -302,7 +372,7 @@ int rs_inference_runner_infer_async(RSInferenceRunner* runner, RSInferTensorArra
             t.name = tensor->name;
             t.shape.assign(tensor->shape->data, tensor->shape->data + tensor->shape->length);
             t.data.assign(tensor->data->data, tensor->data->data + tensor->data->length);
-            t.dtype = static_cast<rsinfer::DataType>(tensor->dtype);
+            t.dtype = to_rsinfer_data_type(tensor->dtype);
             inputs.push_back(std::move(t));
         }
 
@@ -379,7 +449,7 @@ RSInferTensorArray* rs_inference_runner_get_results(RSInferenceRunner* runner, R
             }
             for (size_t d = 0; d < tensor.shape.size(); ++d)
                 shape_array->data[d] = static_cast<long long>(tensor.shape[d]);
-            output_array->tensors[i] = rs_infer_tensor_create(tensor.name.c_str(), tensor.name.size(), static_cast<RSInferDataType>(tensor.dtype), data_array, shape_array);
+            output_array->tensors[i] = rs_infer_tensor_create(tensor.name.c_str(), tensor.name.size(), to_public_data_type(tensor.dtype), data_array, shape_array);
             if (!output_array->tensors[i])
             {
                 // `rs_infer_tensor_create` did not take ownership on failure.
@@ -508,7 +578,7 @@ RSInferDataType rs_inference_runner_get_tensor_data_type(RSInferenceRunner* runn
     {
         auto tensorrtrunner = static_cast<rsinfer::TensorRTRunner*>(runner->runner);
         nvinfer1::DataType data_type = tensorrtrunner->get_tensor_data_type(tensor_name);
-        return static_cast<RSInferDataType>(data_type);
+        return tensorrt_data_type_to_public(data_type);
     }
     catch (const std::exception& e)
     {
@@ -536,7 +606,16 @@ size_t rs_inference_runner_get_tensor_data_size(RSInferenceRunner* runner, RSInf
     try
     {
         auto tensorrtrunner = static_cast<rsinfer::TensorRTRunner*>(runner->runner);
-        nvinfer1::DataType trt_data_type = static_cast<nvinfer1::DataType>(data_type);
+        nvinfer1::DataType trt_data_type;
+        if (!public_data_type_to_tensorrt(data_type, trt_data_type))
+        {
+            if (error)
+            {
+                error->code = ERROR_CODE_INVALID_ARGUMENTS;
+                error->message = strdup("Unsupported tensor data type");
+            }
+            return 0;
+        }
         return tensorrtrunner->get_tensor_data_size(trt_data_type);
     }
     catch (const std::exception& e)

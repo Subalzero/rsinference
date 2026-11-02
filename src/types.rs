@@ -1,7 +1,8 @@
 use crate::ffi::{RSInferIntArray, RSInferLLArray, RSInferTensor};
 use crate::error::{DataResult};
 
-pub type Shape = Vec<u64>;
+/// Tensor dimensions. Negative values represent dynamic or unresolved dimensions.
+pub type Shape = Vec<i64>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Default, Ord, Hash)]
 pub enum Dtype {
@@ -70,23 +71,53 @@ impl Tensor {
     pub unsafe fn from_rs_infer_tensor_ptr(rs_tensor: &*mut RSInferTensor) -> DataResult<Self> {
         let mut tensor = Tensor::default();
 
+        if rs_tensor.is_null() {
+            return Err(crate::error::DataError::InvalidStructure {
+                datatype: "tensor".to_string(),
+                message: "received a null tensor pointer".to_string(),
+            });
+        }
+
         unsafe {
             let rs_tensor_ref = &**rs_tensor;
+            if rs_tensor_ref.name.is_null() {
+                return Err(crate::error::DataError::InvalidStructure {
+                    datatype: "tensor".to_string(),
+                    message: "tensor name is null".to_string(),
+                });
+            }
             tensor.name = std::ffi::CStr::from_ptr(rs_tensor_ref.name)
                 .to_string_lossy()
                 .into_owned();
             tensor.shape = from_rs_infer_ll_array_ptr(&rs_tensor_ref.shape)?;
             tensor.dtype = Dtype::from_c_int(rs_tensor_ref.dtype);
+
+            if !rs_tensor_ref.data.is_null() {
+                let data = &*rs_tensor_ref.data;
+                if !data.data.is_null() {
+                    tensor.data =
+                        std::slice::from_raw_parts(data.data, data.length).to_vec();
+                }
+            }
         }
         Ok(tensor)
     }
 }
 
 pub unsafe fn from_rs_infer_int_array_ptr(rs_array: &*mut RSInferIntArray) -> DataResult<Shape> {
+        if rs_array.is_null() {
+            return Err(crate::error::DataError::InvalidStructure {
+                datatype: "shape".to_string(),
+                message: "received a null int array pointer".to_string(),
+            });
+        }
         let rs_int_arr_ref = unsafe { &**rs_array };
+        if rs_int_arr_ref.data.is_null() {
+            return Ok(Vec::new());
+        }
         let dims = unsafe { std::slice::from_raw_parts(rs_int_arr_ref.data, rs_int_arr_ref.length as usize) }
             .iter()
-            .map(|&d| d as u64)
+            .map(|&d| d as i64)
             .collect::<Vec<_>>();
         Ok(dims)
     }
@@ -94,10 +125,19 @@ pub unsafe fn from_rs_infer_int_array_ptr(rs_array: &*mut RSInferIntArray) -> Da
     /// Changes the c object to Rust object Shape
     /// Make sure to check if the input is not null
     pub unsafe fn from_rs_infer_ll_array_ptr(rs_array: &*mut RSInferLLArray) -> DataResult<Shape> {
+        if rs_array.is_null() {
+            return Err(crate::error::DataError::InvalidStructure {
+                datatype: "shape".to_string(),
+                message: "received a null shape pointer".to_string(),
+            });
+        }
         let rs_int_arr_ref = unsafe { &**rs_array };
+        if rs_int_arr_ref.data.is_null() {
+            return Ok(Vec::new());
+        }
         let dims = unsafe { std::slice::from_raw_parts(rs_int_arr_ref.data, rs_int_arr_ref.length as usize) }
             .iter()
-            .map(|&d| d as u64)
+            .map(|&d| d as i64)
             .collect::<Vec<_>>();
         Ok(dims)
     }

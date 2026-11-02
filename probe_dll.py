@@ -8,7 +8,7 @@ k32.GetProcAddress.restype = wintypes.HMODULE  # actually FARPROC; truthiness is
 k32.GetProcAddress.argtypes = [wintypes.HMODULE, ctypes.c_char_p]
 k32.FreeLibrary.argtypes = [wintypes.HMODULE]
 
-path = r"cpp\install\x64-release\bin\infertensorrt_cpp.dll"
+path = r"cpp\install\x64-release\bin\infertensorrt.dll"
 
 
 def rva_to_offset(data, rva):

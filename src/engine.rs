@@ -1,6 +1,6 @@
 //! Engine handling shared by all backends.
 
-use std::ffi::{CStr, c_int};
+use std::ffi::{CStr, CString, c_int};
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -10,11 +10,7 @@ use crate::error::{EngineError, EngineResult, InferError, InferResult};
 use crate::ffi::{RSInferError, RSInferTensor, RSInferenceRunner};
 use crate::Bridge;
 use crate::types::*;
-use std::os::raw::{c_char, c_uint, c_void};
-
-unsafe extern "C" {
-    unsafe fn free(ptr: *mut c_void);
-}
+use std::os::raw::{c_char, c_uint};
 
 /// Inference backend an [`Engine`] talks to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,12 +33,12 @@ impl EngineType {
 
     /// CMake target name of the C++ bridge that implements this backend.
     ///
-    /// [`Bridge::load_backend`] turns this into `infertensorrt_cpp.dll`,
-    /// `libinfertensorrt_cpp.so`, `libinfertensorrt_cpp.dylib`, ... for the
+    /// [`Bridge::load_backend`] turns this into `infertensorrt.dll`,
+    /// `libinfertensorrt.so`, `libinfertensorrt.dylib`, ... for the
     /// platform the crate was built for.
     const fn bridge_name(self) -> &'static str {
         match self {
-            EngineType::TensorRT => "infertensorrt_cpp",
+            EngineType::TensorRT => "infertensorrt",
             EngineType::OpenVINO => "inferopenvino_cpp",
             EngineType::ONNX => "inferonnx_cpp",
         }
@@ -129,8 +125,9 @@ impl InferInstance<'_> {
             .to_string_lossy()
             .into_owned();
 
-        // The C++ side allocated this with strdup; free it.
-        unsafe { free(name_ptr as *mut c_void) };
+        // The C++ side allocated this; release it with the bridge so the
+        // matching C runtime performs the free.
+        unsafe { (self.engine.bridge.string_free)(name_ptr) };
 
         Ok(name)
     }
@@ -157,16 +154,21 @@ impl InferInstance<'_> {
             .to_string_lossy()
             .into_owned();
 
-        // The C++ side allocated this with strdup; free it.
-        unsafe { free(name_ptr as *mut c_void) };
+        // The C++ side allocated this; release it with the bridge so the
+        // matching C runtime performs the free.
+        unsafe { (self.engine.bridge.string_free)(name_ptr) };
 
         Ok(name)
     }
 
     /// Data type of a tensor, as expected by the engine specified by name.
     pub fn tensor_dtype(&self, name: &str) -> Result<Dtype, InferError> {
+        let name_c = CString::new(name).map_err(|_| InferError::Backend {
+            message: "tensor name contains an interior NUL".to_string(),
+        })?;
+
         let mut err: RSInferError = RSInferError::default();
-        let dtype = unsafe { (self.engine.bridge.runner_get_tensor_data_type)(self.runner, name.as_ptr() as *const i8, &mut err) };
+        let dtype = unsafe { (self.engine.bridge.runner_get_tensor_data_type)(self.runner, name_c.as_ptr(), &mut err) };
 
         if err.code != 0 || !err.message.is_null() {
             return Err(take_error(&mut err, &self.engine.bridge).unwrap_or(InferError::Backend {
@@ -189,7 +191,13 @@ impl InferInstance<'_> {
         let tensors = unsafe { std::slice::from_raw_parts_mut((*rs_infer_tensor_arr_ptr).tensors, (*rs_infer_tensor_arr_ptr).length) };
 
         for (raw_t, inp) in tensors.iter_mut().zip(inputs.iter()) {
-            let rs_tensor_ptr = unsafe { self.rs_tensor_from_tensor(inp)? };
+            let rs_tensor_ptr = match unsafe { self.rs_tensor_from_tensor(inp) } {
+                Ok(ptr) => ptr,
+                Err(err) => {
+                    unsafe { (self.engine.bridge.tensorarray_destroy)(rs_infer_tensor_arr_ptr) };
+                    return Err(err);
+                }
+            };
             *raw_t = rs_tensor_ptr;
         }
 
@@ -228,7 +236,13 @@ impl InferInstance<'_> {
         let tensors = unsafe { std::slice::from_raw_parts_mut((*rs_infer_tensor_arr_ptr).tensors, (*rs_infer_tensor_arr_ptr).length) };
 
         for (raw_t, inp) in tensors.iter_mut().zip(inputs.iter()) {
-            let rs_tensor_ptr = unsafe { self.rs_tensor_from_tensor(inp)? };
+            let rs_tensor_ptr = match unsafe { self.rs_tensor_from_tensor(inp) } {
+                Ok(ptr) => ptr,
+                Err(err) => {
+                    unsafe { (self.engine.bridge.tensorarray_destroy)(rs_infer_tensor_arr_ptr) };
+                    return Err(err);
+                }
+            };
             *raw_t = rs_tensor_ptr;
         }
 
@@ -271,15 +285,16 @@ impl InferInstance<'_> {
             }));
         }
 
-        let tensors = unsafe { std::slice::from_raw_parts((*rs_infer_tensor_arr_ptr).tensors, (*rs_infer_tensor_arr_ptr).length) }
+        let tensors_result = unsafe { std::slice::from_raw_parts((*rs_infer_tensor_arr_ptr).tensors, (*rs_infer_tensor_arr_ptr).length) }
             .iter()
             .map(|&t| unsafe { Tensor::from_rs_infer_tensor_ptr(&t) })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>();
 
-        // The C++ side copied everything, so free the inputs whatever rc was.
+        // The bridge allocated the result array; release it even if a tensor
+        // fails conversion.
         unsafe { (self.engine.bridge.tensorarray_destroy)(rs_infer_tensor_arr_ptr) };
 
-        Ok(tensors)
+        tensors_result.map_err(InferError::from)
     }
 
     /// Input shape of the engine, in row-major order.
@@ -364,7 +379,7 @@ impl InferInstance<'_> {
         // populate the llarray
         let ll_slice = unsafe { std::slice::from_raw_parts_mut((*rs_ll_arr_ptr).data, shape_len) };
         for (item, dim) in ll_slice.iter_mut().zip(tensor.shape.iter()) {
-            *item = dim.clone() as i64;
+            *item = *dim;
         }
 
         // Convert data to c_data
@@ -422,7 +437,7 @@ impl Engine {
         })
     }
 
-    pub fn create_infer_instance(&self, model_path: &PathBuf, config_path: Option<&PathBuf>) -> EngineResult<InferInstance<'_>> {
+    pub fn create_infer_instance(&self, model_path: &PathBuf, json_config: Option<&str>) -> EngineResult<InferInstance<'_>> {
 
         let metadata = std::fs::metadata(&model_path).map_err(|source| EngineError::Load {
             path: model_path.display().to_string(),
@@ -439,11 +454,28 @@ impl Engine {
             });
         }
 
+        let model_c = CString::new(model_path.to_string_lossy().as_bytes()).map_err(|_| {
+            EngineError::Load {
+                path: model_path.display().to_string(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "path contains an interior NUL",
+                ),
+            }
+        })?;
+
+        let config_c = json_config
+            .map(CString::new)
+            .transpose()
+            .map_err(|_| EngineError::Engine {
+                message: "json config contains an interior NUL".to_string(),
+            })?;
+
         let mut error = RSInferError::default();
         let runner = unsafe {
             (self.bridge.runner_create)(
-                model_path.to_str().unwrap().as_ptr() as *const i8,
-                config_path.map_or(ptr::null(), |p| p.to_str().unwrap().as_ptr() as *const i8),
+                model_c.as_ptr(),
+                config_c.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
                 &mut error,
             )
         };
