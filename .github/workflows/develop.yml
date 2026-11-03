@@ -1,22 +1,201 @@
-name: Rust
+name: Develop
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "develop" ]
   pull_request:
-    branches: [ "master" ]
+    branches: [ "develop", "master" ]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
-    runs-on: ubuntu-latest
-
+  cpp:
+    name: C++ bridge (build + ctest)
+    runs-on: ubuntu-24.04
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/cpp/thirdparty/vcpkg
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-cache
+      DEPS_DIR: ${{ github.workspace }}/deps
+      BUILD_DIR: cpp/build/linux-release
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies (toolchain, CUDA, TensorRT, OpenVINO)
+        run: bash scripts/install-deps.sh
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('cpp/vcpkg.json') }}
+          restore-keys: vcpkg-${{ runner.os }}-
+
+      - name: Bootstrap vcpkg
+        run: |
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+
+      - name: Configure
+        run: |
+          cmake -S cpp -B "$BUILD_DIR" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc-14 \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
+            -DCUDA_TOOLKIT_ROOT_DIR="$CUDA_TOOLKIT_ROOT_DIR" \
+            -DCUDAToolkit_ROOT="$CUDA_TOOLKIT_ROOT_DIR" \
+            -DTENSORRT_DIR="$TENSORRT_DIR" \
+            -DOPENVINO_DIR="$OPENVINO_DIR" \
+            -DBUILD_EXAMPLES=OFF
+
+      - name: Build
+        run: cmake --build "$BUILD_DIR"
+
+      - name: Test
+        run: |
+          export LD_LIBRARY_PATH="$TENSORRT_DIR/lib:$OPENVINO_DIR/lib/intel64:$CUDA_TOOLKIT_ROOT_DIR/lib64:${LD_LIBRARY_PATH:-}"
+          ctest --test-dir "$BUILD_DIR" --output-on-failure
+
+      - name: Collect bridge libraries
+        run: |
+          mkdir -p bridge
+          cp -L "$BUILD_DIR"/libinfer*.so bridge/
+          ls -l bridge
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bridge-linux
+          path: bridge/*.so
+          if-no-files-found: error
+
+  rust:
+    name: Rust (build + test)
+    needs: cpp
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libclang for bindgen
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libclang-dev clang
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bridge-linux
+          path: bridge
+
+      - name: Build
+        env:
+          INFERTENSORRT_BIN_DIR: ${{ github.workspace }}/bridge
+        run: cargo build --verbose
+
+      - name: Test
+        env:
+          INFERTENSORRT_BIN_DIR: ${{ github.workspace }}/bridge
+        run: cargo test --verbose
+
+  cpp-windows:
+    name: C++ bridge (Windows, build + ctest)
+    runs-on: windows-2022
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/cpp/thirdparty/vcpkg
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-cache
+      DEPS_DIR: C:\deps
+      BUILD_DIR: cpp/build/x64-release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies (toolchain, CUDA, TensorRT, OpenVINO)
+        shell: pwsh
+        run: ./scripts/install-deps.ps1
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('cpp/vcpkg.json') }}
+          restore-keys: vcpkg-${{ runner.os }}-
+
+      - name: Bootstrap vcpkg
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          & "$env:VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S cpp -B $env:BUILD_DIR -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=cl.exe `
+            -DCMAKE_CXX_COMPILER=cl.exe `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DCUDA_TOOLKIT_ROOT_DIR="$env:CUDA_TOOLKIT_ROOT_DIR" `
+            -DCUDAToolkit_ROOT="$env:CUDA_TOOLKIT_ROOT_DIR" `
+            -DTENSORRT_DIR="$env:TENSORRT_DIR" `
+            -DOPENVINO_DIR="$env:OPENVINO_DIR" `
+            -DBUILD_EXAMPLES=OFF
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build $env:BUILD_DIR
+
+      - name: Test
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:TENSORRT_DIR\bin;$env:OPENVINO_DIR\bin\intel64\Release;$env:OPENVINO_DIR\3rdparty\tbb\bin;$env:PATH"
+          ctest --test-dir $env:BUILD_DIR --output-on-failure
+
+      - name: Collect bridge libraries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force bridge | Out-Null
+          Copy-Item "$env:BUILD_DIR/infer*.dll" bridge/
+          Get-ChildItem bridge
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bridge-windows
+          path: bridge/*.dll
+          if-no-files-found: error
+
+  rust-windows:
+    name: Rust (Windows, build + test)
+    needs: cpp-windows
+    runs-on: windows-2022
+    env:
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bridge-windows
+          path: bridge
+
+      - name: Build
+        env:
+          INFERTENSORRT_BIN_DIR: ${{ github.workspace }}/bridge
+        run: cargo build --verbose
+
+      - name: Test
+        env:
+          INFERTENSORRT_BIN_DIR: ${{ github.workspace }}/bridge
+        run: cargo test --verbose
