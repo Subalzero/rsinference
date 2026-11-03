@@ -103,6 +103,9 @@ if want tensorrt; then
   trt_major="${tensorrt_version%%.*}"
   apt_install \
     "libnvinfer${trt_major}=${tensorrt_version}" \
+    "libnvinfer-headers-dev=${tensorrt_version}" \
+    "libnvinfer-safe-headers-dev=${tensorrt_version}" \
+    "libnvinfer-headers-plugin-dev=${tensorrt_version}" \
     "libnvinfer-dev=${tensorrt_version}" \
     "libnvinfer-plugin${trt_major}=${tensorrt_version}" \
     "libnvinfer-plugin-dev=${tensorrt_version}" \
