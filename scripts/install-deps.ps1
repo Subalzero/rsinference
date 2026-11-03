@@ -87,7 +87,7 @@ try {
             $installer = Join-Path $tmp 'cuda_network.exe'
             Get-Download "https://developer.download.nvidia.com/compute/cuda/$CudaVersion/network_installers/cuda_${CudaVersion}_windows_network.exe" $installer
             # Compiler and runtime only; skips the driver and Visual Studio integration.
-            $proc = Start-Process -FilePath $installer -ArgumentList '-s', "nvcc_$short", "cudart_$short" -Wait -PassThru
+            $proc = Start-Process -FilePath $installer -ArgumentList '-s', '-n', "nvcc_$short", "cudart_$short", "crt_$short" -Wait -PassThru
             if ($proc.ExitCode -ne 0) { throw "CUDA installer failed with exit code $($proc.ExitCode)." }
         }
         if (-not (Test-Path (Join-Path $root 'include\cuda.h'))) {
