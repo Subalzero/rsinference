@@ -21,6 +21,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # vcpkg resolves manifest versions from git history, so it needs a full clone.
+          fetch-depth: 0
           submodules: recursive
 
       - name: Install dependencies (toolchain, CUDA, TensorRT, OpenVINO)
@@ -113,6 +115,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # vcpkg resolves manifest versions from git history, so it needs a full clone.
+          fetch-depth: 0
           submodules: recursive
 
       - name: Install dependencies (toolchain, CUDA, TensorRT, OpenVINO)
@@ -139,8 +143,8 @@ jobs:
         run: |
           cmake -S cpp -B $env:BUILD_DIR -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_C_COMPILER=cl.exe `
-            -DCMAKE_CXX_COMPILER=cl.exe `
+            "-DCMAKE_C_COMPILER=cl.exe" `
+            "-DCMAKE_CXX_COMPILER=cl.exe" `
             -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/cpp/thirdparty/vcpkg/scripts/buildsystems/vcpkg.cmake" `
             -DCUDA_TOOLKIT_ROOT_DIR="$env:CUDA_TOOLKIT_ROOT_DIR" `
             -DCUDAToolkit_ROOT="$env:CUDA_TOOLKIT_ROOT_DIR" `
