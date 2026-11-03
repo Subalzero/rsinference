@@ -18,12 +18,19 @@ include(CMakePackageConfigHelpers)
 # Options
 # ---------------------------------------------------------------------------
 option(INFERTENSORRT_BUILD_SHARED "Build infertensorrt as a shared library (DLL)" ON)
+option(INFEROPENVINO_BUILD_SHARED "Build infertensorrt as a shared library (DLL)" ON)
 option(BUILD_EXAMPLES "Build example applications" ON)
 
 if(INFERTENSORRT_BUILD_SHARED)
     set(INFERTENSORRT_LIBRARY_TYPE SHARED)
 else()
     set(INFERTENSORRT_LIBRARY_TYPE STATIC)
+endif()
+
+if(INFEROPENVINO_BUILD_SHARED)
+    set(INFEROPENVINO_LIBRARY_TYPE SHARED)
+else()
+    set(INFEROPENVINO_LIBRARY_TYPE STATIC)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -35,11 +42,20 @@ file(GLOB_RECURSE INFERTENSORRT_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/tensorrt/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/helpers/*.cpp"
 )
+
+file(GLOB_RECURSE INFEROPENVINO_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/openvino/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/helpers/*.cpp"
+)
 list(REMOVE_ITEM INFERTENSORRT_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
 # src/samples/ holds standalone executables, not library sources.
 list(FILTER INFERTENSORRT_SOURCES EXCLUDE REGEX "/src/samples/")
 
 file(GLOB_RECURSE INFERTENSORRT_PUBLIC_HEADERS CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/*.hpp"
+)
+file(GLOB_RECURSE INFEROPENVINO_PUBLIC_HEADERS CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/include/*.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/*.hpp"
 )
@@ -113,6 +129,18 @@ if(TENSORRT_DIR)
     endif()
 else()
     message(WARNING "TENSORRT_DIR is not set; TensorRT headers and libraries will not be available.")
+endif()
+
+# OpenVINO is optional, but if the user has it installed, prefer the CMake config over the deprecated FindOpenVINO module.
+if(NOT OPENVINO_DIR AND DEFINED ENV{OPENVINO_DIR})
+    set(OPENVINO_DIR "$ENV{OPENVINO_DIR}")
+endif()
+set(INFEROPENVINO_FOUND FALSE)
+find_package(OpenVINO QUIET CONFIG HINTS "${OPENVINO_DIR}/cmake")
+if(OpenVINO_FOUND)
+    set(INFEROPENVINO_FOUND TRUE)
+else()
+    message(STATUS "OpenVINO was not found; inferopenvino will not be built.")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -198,6 +226,55 @@ generate_export_header(infertensorrt
     EXPORT_MACRO_NAME INFERTENSORRT_EXPORT
     EXPORT_FILE_NAME "${CMAKE_CURRENT_BINARY_DIR}/include/infertensorrt/export.h"
 )
+# ------------------------------------------------------------------------------
+# OpenVINO library (DLL on Windows, .so/.dylib elsewhere)
+# ------------------------------------------------------------------------------
+if(INFEROPENVINO_FOUND)
+    add_library(inferopenvino ${INFEROPENVINO_LIBRARY_TYPE})
+    add_library(inferopenvino::inferopenvino ALIAS inferopenvino)
+    if(INFEROPENVINO_BUILD_SHARED)
+        target_compile_definitions(inferopenvino PRIVATE INFEROPENVINO_BUILD)
+    else()
+        target_compile_definitions(inferopenvino PUBLIC INFEROPENVINO_STATIC)
+    endif()
+
+target_sources(inferopenvino PRIVATE
+    ${INFEROPENVINO_SOURCES}
+)
+
+target_include_directories(inferopenvino
+    PUBLIC
+        "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+        "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>"
+        "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/public>"
+        "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
+    PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/openvino"
+)
+
+target_link_libraries(inferopenvino
+    PRIVATE
+        openvino::runtime
+        nlohmann_json::nlohmann_json
+)
+
+set_target_properties(inferopenvino PROPERTIES
+    VERSION ${PROJECT_VERSION}
+    SOVERSION ${PROJECT_VERSION_MAJOR}
+    # Keep the DLL/import-library name stable for downstream consumers.
+    OUTPUT_NAME "inferopenvino"
+)
+
+# Generates include/infertensorrt/export.h (build tree) with
+# INFERTENSORRT_EXPORT / INFERTENSORRT_NO_EXPORT macros. Annotate every public
+# function or class you want visible from the DLL with INFERTENSORRT_EXPORT.
+    generate_export_header(inferopenvino
+        BASE_NAME INFEROPENVINO
+        EXPORT_MACRO_NAME INFEROPENVINO_EXPORT
+        EXPORT_FILE_NAME "${CMAKE_CURRENT_BINARY_DIR}/include/inferopenvino/export.h"
+    )
+endif()
 
 # ---------------------------------------------------------------------------
 # Optional executable for local development
@@ -304,12 +381,30 @@ install(TARGETS infertensorrt
     INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 
+if(INFEROPENVINO_FOUND)
+    install(TARGETS inferopenvino
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    )
+    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/include/inferopenvino/export.h"
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/inferopenvino"
+    )
+endif()
+
+set(INFEROPENVINO_HEADER_EXCLUDE)
+if(NOT INFEROPENVINO_FOUND)
+    set(INFEROPENVINO_HEADER_EXCLUDE PATTERN "openvino" EXCLUDE)
+endif()
+
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/include")
     install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/"
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
         FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"
         # include/tensorrt is private implementation detail.
         PATTERN "tensorrt" EXCLUDE
+        ${INFEROPENVINO_HEADER_EXCLUDE}
     )
 endif()
 
