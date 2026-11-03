@@ -8,9 +8,9 @@ extern "C" {
 #include <stddef.h>
 
 #ifdef _WIN32
-    #if defined(INFERTENSORRT_STATIC)
+    #if defined(INFERTENSORRT_STATIC) || defined(INFEROPENVINO_STATIC)
         #define BACKEND_EXPORT
-    #elif defined(INFERTENSORRT_BUILD)
+    #elif defined(INFERTENSORRT_BUILD) || defined(INFEROPENVINO_BUILD)
         #define BACKEND_EXPORT __declspec(dllexport)
     #else
         #define BACKEND_EXPORT __declspec(dllimport)

@@ -41,6 +41,21 @@ namespace rsinfer
 				: onnx_file.substr(0, dot);
 			return base + (dynamic ? ".dynamic.engine" : ".engine");
 		}
+
+		// The engine cache has no metadata sidecar, so it cannot prove that a
+		// serialized plan was built with the current builder options. Only reuse
+		// it when all build settings are at their defaults.
+		bool has_builder_overrides(const RunnerParams& params)
+		{
+			return params.dlaCore != -1 || params.int8 || params.fp16 || params.bf16 || !params.builderFlags.empty()
+				|| params.builderOptimizationLevel || params.avgTimingIterations || params.maxAuxStreams
+				|| params.maxThreads || params.tacticSources || params.profilingVerbosity
+				|| params.engineCapability || params.hardwareCompatibilityLevel || params.defaultDeviceType
+				|| params.runtimePlatform || params.tilingOptimizationLevel || params.tilingL2Limit
+				|| !params.previewFeatures.empty() || !params.pluginsToSerialize.empty()
+				|| !params.layerDeviceTypes.empty() || !params.allowGpuFallback
+				|| !params.memoryPoolLimits.empty() || !params.timingCacheFile.empty();
+		}
 	} // namespace
 
 	TensorRTRunner::TensorRTRunner()
@@ -90,10 +105,12 @@ namespace rsinfer
 		{
 			return false;
 		}
+		if (_params.maxThreads && !builder->setMaxThreads(*_params.maxThreads))
+			return false;
 
 		std::vector<char> plan_data;
 		bool load_engine_success = false;
-		if (load_engine(plan_data))
+		if (!has_builder_overrides(_params) && load_engine(plan_data))
 		{
 			_runtime = std::shared_ptr<nvinfer1::IRuntime>(createInferRuntime(sample::gLogger.getTRTLogger()));
 			if (_runtime)
@@ -122,6 +139,43 @@ namespace rsinfer
 			{
 				return false;
 			}
+
+			for (const auto flag : _params.builderFlags)
+				config->setFlag(flag);
+			if (_params.builderOptimizationLevel)
+				config->setBuilderOptimizationLevel(*_params.builderOptimizationLevel);
+			if (_params.avgTimingIterations)
+				config->setAvgTimingIterations(*_params.avgTimingIterations);
+			if (_params.maxAuxStreams && !config->setMaxAuxStreams(*_params.maxAuxStreams))
+				return false;
+			if (_params.tacticSources && !config->setTacticSources(*_params.tacticSources))
+				return false;
+			if (_params.profilingVerbosity)
+				config->setProfilingVerbosity(*_params.profilingVerbosity);
+			if (_params.engineCapability)
+				config->setEngineCapability(*_params.engineCapability);
+			if (_params.hardwareCompatibilityLevel)
+				config->setHardwareCompatibilityLevel(*_params.hardwareCompatibilityLevel);
+			if (_params.defaultDeviceType)
+				config->setDefaultDeviceType(*_params.defaultDeviceType);
+			if (_params.runtimePlatform)
+				config->setRuntimePlatform(*_params.runtimePlatform);
+			if (_params.tilingOptimizationLevel && !config->setTilingOptimizationLevel(*_params.tilingOptimizationLevel))
+				return false;
+			if (_params.tilingL2Limit && !config->setL2LimitForTiling(*_params.tilingL2Limit))
+				return false;
+			for (const auto& [feature, enabled] : _params.previewFeatures)
+				config->setPreviewFeature(feature, enabled);
+			if (!_params.pluginsToSerialize.empty())
+			{
+				std::vector<const char*> plugin_paths;
+				plugin_paths.reserve(_params.pluginsToSerialize.size());
+				for (const auto& path : _params.pluginsToSerialize)
+					plugin_paths.push_back(path.c_str());
+				config->setPluginsToSerialize(plugin_paths.data(), static_cast<int32_t>(plugin_paths.size()));
+			}
+			for (const auto& [pool, size] : _params.memoryPoolLimits)
+				config->setMemoryPoolLimit(pool, size);
 
 			auto parser
 				= std::unique_ptr<nvonnxparser::IParser>(nvonnxparser::createParser(*network, sample::gLogger.getTRTLogger()));
@@ -191,6 +245,21 @@ namespace rsinfer
 		if (_params.nContexts == 0)
 		{
 			return false;
+		}
+		if ((!_params.inputTensorNames.empty() && _params.inputTensorNames.size() != get_number_of_inputs()) ||
+			(!_params.outputTensorNames.empty() && _params.outputTensorNames.size() != get_number_of_outputs()))
+		{
+			return false;
+		}
+		for (const auto& name : _params.inputTensorNames)
+		{
+			if (_engine->getTensorIOMode(name.c_str()) != nvinfer1::TensorIOMode::kINPUT)
+				return false;
+		}
+		for (const auto& name : _params.outputTensorNames)
+		{
+			if (_engine->getTensorIOMode(name.c_str()) != nvinfer1::TensorIOMode::kOUTPUT)
+				return false;
 		}
 
 		uint32_t nireq = _params.nContexts;
@@ -427,6 +496,13 @@ namespace rsinfer
 
 	std::string TensorRTRunner::get_input_tensor_name(uint32_t index) const
 	{
+		if (!_params.inputTensorNames.empty())
+		{
+			if (index >= _params.inputTensorNames.size())
+				throw std::out_of_range("Input tensor index is outside input_tensor_names");
+			return _params.inputTensorNames[index];
+		}
+
 		std::vector<std::string> input_names;
 
 		int numIOTensors = _engine->getNbIOTensors();
@@ -444,6 +520,13 @@ namespace rsinfer
 
 	std::string TensorRTRunner::get_output_tensor_name(uint32_t index) const
 	{
+		if (!_params.outputTensorNames.empty())
+		{
+			if (index >= _params.outputTensorNames.size())
+				throw std::out_of_range("Output tensor index is outside output_tensor_names");
+			return _params.outputTensorNames[index];
+		}
+
 		std::vector<std::string> output_names;
 
 		int numIOTensors = _engine->getNbIOTensors();
@@ -510,6 +593,22 @@ namespace rsinfer
 		{
 			return false;
 		}
+		for (const auto& [layer_name, device_type] : _params.layerDeviceTypes)
+		{
+			bool found = false;
+			for (int32_t i = 0; i < network->getNbLayers(); ++i)
+			{
+				auto* layer = network->getLayer(i);
+				if (layer_name == layer->getName())
+				{
+					config->setDeviceType(layer, device_type);
+					found = true;
+					break;
+				}
+			}
+			if (!found)
+				throw std::runtime_error("Unknown TensorRT layer in layer_device_types: " + layer_name);
+		}
 
 		// TensorRT 11 removed the weak-typing builder flags (kFP16/kBF16/kINT8):
 		// strongly typed networks are always enabled, so the precision of every
@@ -522,7 +621,7 @@ namespace rsinfer
 				sample::gLogger.getTRTLogger(), *config, _params.timingCacheFile);
 		}
 
-		samplesCommon::enableDLA(builder.get(), config.get(), _params.dlaCore);
+			samplesCommon::enableDLA(builder.get(), config.get(), _params.dlaCore, _params.allowGpuFallback);
 
 		return true;
 	}
@@ -611,7 +710,9 @@ namespace rsinfer
 	}
 
 	bool TensorRTRunner::load_engine(std::vector<char>& data) {
-		std::string engineFilePath = engine_path_for(_params.onnxFileName, _params.dynamic);
+		std::string engineFilePath = _params.engineFile.empty()
+			? engine_path_for(_params.onnxFileName, _params.dynamic)
+			: _params.engineFile;
 		std::ifstream file(engineFilePath, std::ios::binary);
 		if (!file) {
 			sample::gLogWarning << "Could not open engine file: " + engineFilePath << std::endl;
@@ -633,7 +734,9 @@ namespace rsinfer
 
 	bool TensorRTRunner::save_engine_to_plan_file(nvinfer1::IHostMemory* plan)
 	{
-		std::string planFilePath = engine_path_for(_params.onnxFileName, _params.dynamic);
+		std::string planFilePath = _params.engineFile.empty()
+			? engine_path_for(_params.onnxFileName, _params.dynamic)
+			: _params.engineFile;
 		std::ofstream planFile(planFilePath, std::ios::binary);
 		planFile.write(reinterpret_cast<const char*>(plan->data()), plan->size());
 		planFile.close();

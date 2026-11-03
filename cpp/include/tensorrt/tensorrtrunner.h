@@ -10,6 +10,9 @@
 
 #include "NvInfer.h"
 #include <cuda_runtime_api.h>
+#include <map>
+#include <optional>
+#include <utility>
 #include <variant>
 
 namespace rsinfer
@@ -18,11 +21,12 @@ namespace rsinfer
 
     struct RunnerParams
     {
-        int32_t batchSize{ 1 };              //!< Number of inputs in a batch
         int32_t dlaCore{ -1 };               //!< Specify the DLA core to run network on.
-        bool int8{ false };                  //!< Allow runnning the network in Int8 mode.
-        bool fp16{ false };                  //!< Allow running the network in FP16 mode.
-        bool bf16{ false };                  //!< Allow running the network in BF16 mode.
+        // Legacy compatibility fields. TensorRT 11 uses strongly typed networks,
+        // so these do not override the ONNX graph's tensor precision.
+        bool int8{ false };
+        bool fp16{ false };
+        bool bf16{ false };
         std::vector<std::string> dataDirs; //!< Directory paths where sample data files are stored
         std::vector<std::string> inputTensorNames;
         std::vector<std::string> outputTensorNames;
@@ -30,6 +34,29 @@ namespace rsinfer
         std::string onnxFileName;  //!< REQUIRED: Model file in ONNX format.
         uint32_t nContexts{ 1 };  //!< Number of contexts tensorrt will generate
         bool dynamic{ false };
+
+        // TensorRT builder configuration. Empty optionals preserve TensorRT defaults.
+        std::vector<nvinfer1::BuilderFlag> builderFlags;
+        std::optional<int32_t> builderOptimizationLevel;
+        std::optional<int32_t> avgTimingIterations;
+        std::optional<int32_t> maxAuxStreams;
+        std::optional<int32_t> maxThreads;
+        std::optional<uint32_t> tacticSources;
+        std::optional<nvinfer1::ProfilingVerbosity> profilingVerbosity;
+        std::optional<nvinfer1::EngineCapability> engineCapability;
+        std::optional<nvinfer1::HardwareCompatibilityLevel> hardwareCompatibilityLevel;
+        std::optional<nvinfer1::DeviceType> defaultDeviceType;
+        std::optional<nvinfer1::RuntimePlatform> runtimePlatform;
+        std::optional<nvinfer1::TilingOptimizationLevel> tilingOptimizationLevel;
+        std::optional<int64_t> tilingL2Limit;
+        std::vector<std::pair<nvinfer1::PreviewFeature, bool>> previewFeatures;
+        std::vector<std::string> pluginsToSerialize;
+        std::map<std::string, nvinfer1::DeviceType> layerDeviceTypes;
+        bool allowGpuFallback{ true };
+        std::map<nvinfer1::MemoryPoolType, size_t> memoryPoolLimits;
+
+        // Optional engine cache path overrides the default model-derived filename.
+        std::string engineFile;
     };
 
     class TensorRTRunner

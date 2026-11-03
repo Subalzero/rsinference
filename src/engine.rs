@@ -63,8 +63,6 @@ pub struct Engine {
     bridge: Bridge,
 }
 
-unsafe impl Sync for Engine {}
-
 #[derive(Debug)]
 pub struct InferInstance<'a> {
     runner: *mut RSInferenceRunner,
@@ -79,11 +77,6 @@ impl PartialEq for InferInstance<'_> {
     }
 }
 impl Eq for InferInstance<'_> {}
-
-// SAFETY: every `&self` method only calls bridge functions that are
-// thread-safe on the C++ side, and the Rust side holds no shared mutable state.
-unsafe impl Send for InferInstance<'_> {}
-unsafe impl Sync for InferInstance<'_> {}
 
 impl Hash for InferInstance<'_> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
