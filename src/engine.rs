@@ -27,8 +27,12 @@ impl EngineType {
     /// Backends without a bridge are rejected with
     /// [`InferError::UnsupportedBackend`] instead of a misleading "file not
     /// found" when the loader looks for a library that was never built.
+    ///
+    /// The OpenVINO bridge is only built when CMake finds OpenVINO, so on a
+    /// machine without it [`Engine::load`] still reports
+    /// [`EngineError::BridgeLoad`] for that backend.
     pub const fn is_implemented(self) -> bool {
-        matches!(self, EngineType::TensorRT)
+        matches!(self, EngineType::TensorRT | EngineType::OpenVINO)
     }
 
     /// CMake target name of the C++ bridge that implements this backend.
@@ -39,8 +43,8 @@ impl EngineType {
     const fn bridge_name(self) -> &'static str {
         match self {
             EngineType::TensorRT => "infertensorrt",
-            EngineType::OpenVINO => "inferopenvino_cpp",
-            EngineType::ONNX => "inferonnx_cpp",
+            EngineType::OpenVINO => "inferopenvino",
+            EngineType::ONNX => "inferonnx",
         }
     }
 }

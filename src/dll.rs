@@ -348,7 +348,7 @@ impl Bridge {
     }
 
     /// Like [`Bridge::load_default_backend`], but for the bridge named `backend`
-    /// (e.g. `"inferonnx_cpp"`).
+    /// (e.g. `"inferopenvino"`).
     pub fn load_backend(backend: &str) -> EngineResult<Self> {
         let name = library_file_name(backend);
         let mut candidates: Vec<PathBuf> = Vec::new();

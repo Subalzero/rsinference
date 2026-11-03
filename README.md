@@ -13,8 +13,8 @@ Rust application → rsinference → infertensorrt shared library → TensorRT �
 | Backend | Bridge | Status |
 | --- | --- | --- |
 | TensorRT | `infertensorrt` | Implemented: runner creation, tensor metadata, sync/async inference, result retrieval |
-| ONNX Runtime | `inferonnx_cpp` | Not implemented |
-| OpenVINO | `inferopenvino_cpp` | Not implemented |
+| ONNX Runtime | `inferonnx` | Not implemented |
+| OpenVINO | `inferopenvino` | Implemented; built only when CMake finds OpenVINO |
 
 `ONNX` models are currently supported through the TensorRT backend's ONNX
 parser. The separate ONNX Runtime backend is not available yet.

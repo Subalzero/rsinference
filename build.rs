@@ -8,10 +8,12 @@
 //! generated bindings, so a missing header is a hard build error.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-/// Name of the CMake target that produces the bridge DLL.
-const DLL_NAME: &str = "infertensorrt";
+/// CMake targets that produce bridge DLLs, as named by
+/// `EngineType::bridge_name` in `src/engine.rs`. `inferopenvino` is only
+/// built when CMake finds OpenVINO.
+const DLL_NAMES: &[&str] = &["infertensorrt", "inferopenvino"];
 
 fn main() {
     println!("cargo:rerun-if-changed=cpp/include");
@@ -55,13 +57,6 @@ fn main() {
     // Locate the built bridge: the runtime loader needs the shared library
     // itself, not an import library. Set INFERTENSORRT_BIN_DIR to point at
     // another build tree.
-    let file_name = format!(
-        "{}{}{}",
-        std::env::consts::DLL_PREFIX,
-        DLL_NAME,
-        std::env::consts::DLL_SUFFIX
-    );
-
     let mut candidates = Vec::new();
     if let Ok(dir) = env::var("INFERTENSORRT_BIN_DIR") {
         candidates.push(PathBuf::from(dir));
@@ -74,54 +69,69 @@ fn main() {
         PathBuf::from("cpp/build/bin"),
     ]);
 
-    let dll = candidates
-        .into_iter()
-        .map(|dir| dir.join(&file_name))
-        .find(|dll| dll.exists());
+    for name in DLL_NAMES {
+        let file_name = format!(
+            "{}{}{}",
+            std::env::consts::DLL_PREFIX,
+            name,
+            std::env::consts::DLL_SUFFIX
+        );
 
-    match dll {
-        Some(dll) => {
-            // Re-run (and re-copy) when the bridge is rebuilt.
-            println!("cargo:rerun-if-changed={}", dll.display());
+        // Candidates are in priority order: the first match wins, so
+        // INFERTENSORRT_BIN_DIR overrides the default build trees.
+        let dll = candidates
+            .iter()
+            .map(|dir| dir.join(&file_name))
+            .find(|dll| dll.exists());
 
-            // Copy the bridge next to the built artifacts so
-            // `Bridge::load_default` resolves it through the exe directory.
-            // `target/<profile>` holds the binaries; `target/<profile>/deps`
-            // holds test and bench executables.
-            // OUT_DIR is target/<profile>/build/<pkg>-<hash>/out, so the
-            // profile directory is three levels up.
-            if let Some(profile_dir) = out_path.ancestors().nth(3) {
-                for (dir, announce) in [
-                    (profile_dir.to_path_buf(), true),
-                    (profile_dir.join("deps"), false),
-                ] {
-                    if !dir.exists() && std::fs::create_dir_all(&dir).is_err() {
-                        continue;
-                    }
-                    let target = dir.join(&file_name);
-                    match std::fs::copy(&dll, &target) {
-                        Ok(_) if announce => println!(
-                            "cargo:warning=copied {} to {}",
-                            file_name,
-                            target.to_string_lossy()
-                        ),
-                        Ok(_) => {}
-                        Err(err) => println!(
-                            "cargo:warning=could not copy {} to {} ({err}); put the bridge's \
-                             directory on PATH",
-                            file_name,
-                            target.to_string_lossy()
-                        ),
-                    }
-                }
+        match dll {
+            Some(dll) => {
+                // Re-run (and re-copy) when the bridge is rebuilt.
+                println!("cargo:rerun-if-changed={}", dll.display());
+                copy_next_to_artifacts(&dll, &file_name, &out_path);
+            }
+            None => {
+                println!(
+                    "cargo:warning={file_name} not found; the crate builds, but loading this \
+                     bridge will fail at runtime (install the C++ bridge, e.g. \
+                     `cmake --install cpp/build/x64-release --prefix cpp/install`)"
+                );
             }
         }
-        None => {
-            println!(
-                "cargo:warning={file_name} not found; the crate builds, but loading the \
-                 bridge will fail at runtime (install the C++ bridge, e.g. \
-                 `cmake --install cpp/build/x64-release --prefix cpp/install`)"
-            );
+    }
+}
+
+/// Copy the bridge next to the built artifacts so `Bridge::load_backend`
+/// resolves it through the exe directory.
+fn copy_next_to_artifacts(dll: &Path, file_name: &str, out_path: &Path) {
+    // `target/<profile>` holds the binaries; `target/<profile>/deps` holds
+    // test and bench executables. OUT_DIR is
+    // target/<profile>/build/<pkg>-<hash>/out, so the profile directory is
+    // three levels up.
+    let Some(profile_dir) = out_path.ancestors().nth(3) else {
+        return;
+    };
+    for (dir, announce) in [
+        (profile_dir.to_path_buf(), true),
+        (profile_dir.join("deps"), false),
+    ] {
+        if !dir.exists() && std::fs::create_dir_all(&dir).is_err() {
+            continue;
+        }
+        let target = dir.join(file_name);
+        match std::fs::copy(dll, &target) {
+            Ok(_) if announce => println!(
+                "cargo:warning=copied {} to {}",
+                file_name,
+                target.to_string_lossy()
+            ),
+            Ok(_) => {}
+            Err(err) => println!(
+                "cargo:warning=could not copy {} to {} ({err}); put the bridge's \
+                 directory on PATH",
+                file_name,
+                target.to_string_lossy()
+            ),
         }
     }
 }
