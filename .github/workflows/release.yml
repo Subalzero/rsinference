@@ -12,9 +12,31 @@ permissions:
   contents: write
 
 jobs:
+  # build.rs downloads the archives from the release named v<crate version>, so a tag
+  # that does not match Cargo.toml would publish archives no build can find. Fails fast,
+  # before the long CI run.
+  version:
+    name: Check tag matches crate version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare tag with Cargo.toml and version.txt
+        run: |
+          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          echo "tag=${GITHUB_REF_NAME} Cargo.toml=${crate}"
+          if [ "${GITHUB_REF_NAME}" != "v${crate}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${crate} (expected v${crate})"
+            exit 1
+          fi
+          if [ -f version.txt ] && [ "$(tr -d '[:space:]' < version.txt)" != "${crate}" ]; then
+            echo "::error::version.txt ($(cat version.txt)) does not match Cargo.toml version ${crate}"
+            exit 1
+          fi
+
   # Builds and tests the bridge and the Rust crate on Linux and Windows; uploads the
   # bridge-linux / bridge-windows artifacts.
   ci:
+    needs: version
     uses: ./.github/workflows/develop.yml
 
   publish:
@@ -45,7 +67,8 @@ jobs:
           }
           bundle bridge-linux   x86_64-unknown-linux-gnu tar.gz
           bundle bridge-windows x86_64-pc-windows-msvc   zip
-          ls -l dist
+          # build.rs verifies every downloaded archive against this file.
+          (cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS && cat SHA256SUMS)
 
       # One job publishes both archives, so the release is created exactly once.
       - uses: softprops/action-gh-release@v2
@@ -53,6 +76,7 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.zip
+            dist/SHA256SUMS
           # Tags with a suffix (v0.1.0-rc1) are marked as pre-releases.
           prerelease: ${{ contains(github.ref_name, '-') }}
           # Lists the PRs merged since the previous tag as the release description.

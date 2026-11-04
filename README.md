@@ -280,8 +280,14 @@ Bridge libraries produced by the container land in `scripts/docker-ci/out/bridge
 Pushing a tag matching `v*` (for example `v0.1.0`) runs
 `.github/workflows/release.yml`. It reuses the full `develop.yml` pipeline
 (bridge build, `ctest`, Rust build and tests on Linux and Windows), then
-attaches one archive per platform to a GitHub Release. Tags with a suffix, such
-as `v0.1.0-rc1`, are published as pre-releases.
+attaches one archive per platform, plus a `SHA256SUMS` file, to a GitHub
+Release. Tags with a suffix, such as `v0.1.0-rc1`, are published as
+pre-releases, and the release notes list the PRs merged since the previous tag.
+
+The tag must be `v` followed by the `version` in `Cargo.toml` (and in
+`version.txt`), because `build.rs` builds the download URL from the crate
+version. A mismatched tag fails the workflow before anything is built. For a
+release candidate, set the version to `0.1.0-rc3` first, then tag `v0.1.0-rc3`.
 
 | Target | Archive |
 | --- | --- |
@@ -300,17 +306,40 @@ rsinference-<tag>-<target>/
 ```
 
 No Rust binaries are shipped. The Rust library is used from the same tag as a
-git dependency, which saves you building the C++ bridge yourself:
+git dependency:
 
 ```toml
 [dependencies]
 rsinference = { git = "https://github.com/Subalzero/rsinference", tag = "v0.1.0" }
 ```
 
-Download the archive for your platform, extract it, and point
-`INFERTENSORRT_BIN_DIR` at its `lib` directory when building your project.
-`build.rs` then copies the bridge libraries next to your executable so
-`Engine::load` finds them:
+### Using the crate: prebuilt bridge download
+
+You don't need to build the C++ bridge. When `cargo build` compiles
+`rsinference` and no bridge is available locally, `build.rs`:
+
+1. downloads `SHA256SUMS` and the archive for your target from the release
+   `v<crate version>`,
+2. checks the archive's SHA-256 against `SHA256SUMS` and refuses it on a
+   mismatch,
+3. unpacks it into Cargo's build directory (cached; later builds don't
+   download again), and
+4. copies the bridge libraries next to your executable, so `Engine::load`
+   finds them.
+
+Prebuilt bridges exist for `x86_64-unknown-linux-gnu` and
+`x86_64-pc-windows-msvc`. If the download fails, the build still succeeds
+with a warning, and the next build retries.
+
+| Environment variable | Effect |
+| --- | --- |
+| `INFERTENSORRT_BIN_DIR` | Use the bridge libraries in this directory; no download |
+| `RSINFERENCE_NO_DOWNLOAD=1` | Never download (offline or vendored builds) |
+| `RSINFERENCE_RELEASE_URL` | Download from this URL instead of the GitHub Release, e.g. a mirror with the same archives and `SHA256SUMS` |
+
+A local bridge build under `cpp/build/` (when working in this repository)
+also skips the download. To supply the bridge manually, extract a release
+archive and point `INFERTENSORRT_BIN_DIR` at its `lib` directory:
 
 ```bash
 INFERTENSORRT_BIN_DIR=/path/to/rsinference-v0.1.0-x86_64-unknown-linux-gnu/lib cargo build
@@ -321,12 +350,19 @@ $env:INFERTENSORRT_BIN_DIR = 'C:\path\to\rsinference-v0.1.0-x86_64-pc-windows-ms
 cargo build
 ```
 
-Building the crate still needs `libclang` for `bindgen`. CUDA, TensorRT, and
-OpenVINO are not included; install them (for example with
-`scripts/install-deps.*`) and make them discoverable as described in
-[Native library lookup](#native-library-lookup). On Linux, put the TensorRT,
-CUDA, and OpenVINO library directories on `LD_LIBRARY_PATH`. Keep the tag in
-step with the `version` in `Cargo.toml`.
+`SHA256SUMS` comes from the same release as the archive, so it catches
+corrupted or swapped downloads, not a release whose files were all replaced.
+Turning on GitHub's immutable releases for the repository stops published
+assets from being changed afterwards.
+
+### What consumers must install
+
+- **CUDA, TensorRT, and OpenVINO runtimes:** not included in the archives.
+  Install them yourself (for example with `scripts/install-deps.*`) and make
+  them discoverable as described in
+  [Native library lookup](#native-library-lookup). On Linux, put their library
+  directories on `LD_LIBRARY_PATH`.
+- **`libclang`:** `bindgen` needs it to build the crate.
 
 ## License
 
