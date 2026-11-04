@@ -18,5 +18,12 @@ thiserror = "2"
 # Runtime symbol resolution against the C++ bridge DLL (no link-time dependency).
 libloading = "0.8"
 
+[features]
+# Enables the tests that run real inference. They need working hardware and drivers
+# (an NVIDIA GPU for TensorRT, a healthy CPU runtime for OpenVINO), which CI runners
+# lack, so they are ignored unless this feature is set:
+#   cargo test --features hardware-tests
+hardware-tests = []
+
 [build-dependencies]
 bindgen = "0.71"

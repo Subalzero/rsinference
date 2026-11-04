@@ -519,14 +519,23 @@ impl Drop for Engine {
 mod tests {
     use super::*;
 
+    /// Declares a test that needs real hardware. It is ignored (and listed as such) unless
+    /// the `hardware-tests` feature is set: `cargo test --features hardware-tests`.
+    macro_rules! hardware_test {
+        ($(#[$meta:meta])* fn $name:ident() $body:block) => {
+            #[test]
+            #[cfg_attr(
+                not(feature = "hardware-tests"),
+                ignore = "needs real hardware; run with --features hardware-tests"
+            )]
+            $(#[$meta])*
+            fn $name() $body
+        };
+    }
+
     #[test]
     fn load_missing_model_reports_error() {
-        let Some(engine) = load_or_skip(
-            EngineType::TensorRT,
-            "put TensorRT's bin and the CUDA toolkit's bin on PATH (LD_LIBRARY_PATH on Linux)",
-        ) else {
-            return;
-        };
+        let Some(engine) = tensorrt_engine() else { return };
         let err = engine.create_infer_instance(&PathBuf::from("nonexistent.engine"), None).unwrap_err();
         assert!(matches!(err, EngineError::Load { .. }));
     }
@@ -537,13 +546,14 @@ mod tests {
         assert!(matches!(err, EngineError::UnsupportedBackend { .. }));
     }
 
-    #[test]
-    #[ignore] // needs an NVIDIA GPU to build the TensorRT engine
-    fn load_existing_model_succeeds() {
-        let engine = Engine::load(EngineType::TensorRT).unwrap();
-        let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/version-RFB-640.onnx");
-        let instance = engine.create_infer_instance(&model_path, None).unwrap();
-        assert_eq!(instance.model_path(), &model_path);
+    // Needs an NVIDIA GPU to build the TensorRT engine.
+    hardware_test! {
+        fn load_existing_model_succeeds() {
+            let engine = Engine::load(EngineType::TensorRT).unwrap();
+            let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/version-RFB-640.onnx");
+            let instance = engine.create_infer_instance(&model_path, None).unwrap();
+            assert_eq!(instance.model_path(), &model_path);
+        }
     }
 
     // OpenVINO runs the sample model on the CPU, so these need no GPU. See
@@ -565,6 +575,13 @@ mod tests {
             }
             Err(err) => panic!("{backend:?} bridge did not load: {err:?}"),
         }
+    }
+
+    fn tensorrt_engine() -> Option<Engine> {
+        load_or_skip(
+            EngineType::TensorRT,
+            "put TensorRT's bin and the CUDA toolkit's bin on PATH (LD_LIBRARY_PATH on Linux)",
+        )
     }
 
     fn openvino_engine() -> Option<Engine> {
@@ -659,22 +676,25 @@ mod tests {
         assert!(instance.output_shape(2).is_err());
     }
 
-    #[test]
-    fn openvino_infer_returns_outputs() {
-        let Some(engine) = openvino_engine() else { return };
-        let instance = engine.create_infer_instance(&sample_model(), OPENVINO_CPU).unwrap();
-        instance.infer(&[sample_input()]).unwrap();
-        assert_sample_outputs(&instance.get_results().unwrap());
+    // These run real inference, which hangs on runners without usable hardware/drivers.
+    hardware_test! {
+        fn openvino_infer_returns_outputs() {
+            let Some(engine) = openvino_engine() else { return };
+            let instance = engine.create_infer_instance(&sample_model(), OPENVINO_CPU).unwrap();
+            instance.infer(&[sample_input()]).unwrap();
+            assert_sample_outputs(&instance.get_results().unwrap());
+        }
     }
 
-    #[test]
-    fn openvino_infer_async_returns_outputs() {
-        let Some(engine) = openvino_engine() else { return };
-        let instance = engine.create_infer_instance(&sample_model(), OPENVINO_CPU).unwrap();
-        instance.infer_async(&[sample_input()]).unwrap();
-        instance.infer_async(&[sample_input()]).unwrap();
-        assert_sample_outputs(&instance.get_results().unwrap());
-        assert_sample_outputs(&instance.get_results().unwrap());
+    hardware_test! {
+        fn openvino_infer_async_returns_outputs() {
+            let Some(engine) = openvino_engine() else { return };
+            let instance = engine.create_infer_instance(&sample_model(), OPENVINO_CPU).unwrap();
+            instance.infer_async(&[sample_input()]).unwrap();
+            instance.infer_async(&[sample_input()]).unwrap();
+            assert_sample_outputs(&instance.get_results().unwrap());
+            assert_sample_outputs(&instance.get_results().unwrap());
+        }
     }
 
     #[test]
@@ -682,5 +702,61 @@ mod tests {
         let Some(engine) = openvino_engine() else { return };
         let instance = engine.create_infer_instance(&sample_model(), OPENVINO_CPU).unwrap();
         assert!(instance.get_results().is_err());
+    }
+
+    // TensorRT builds (or loads the cached) engine for the sample model, which needs an
+    // NVIDIA GPU and driver. The first run builds `models/version-RFB-640.engine`.
+    hardware_test! {
+        fn tensorrt_reports_model_io() {
+            let Some(engine) = tensorrt_engine() else { return };
+            let instance = engine.create_infer_instance(&sample_model(), None).unwrap();
+            assert_eq!(instance.engine_type(), EngineType::TensorRT);
+
+            assert_eq!(instance.input_name(0).unwrap(), "input");
+            assert_eq!(instance.input_shape(0).unwrap(), vec![1, 3, 480, 640]);
+            assert_eq!(instance.tensor_dtype("input").unwrap(), Dtype::F32);
+
+            let mut outputs = [
+                (instance.output_name(0).unwrap(), instance.output_shape(0).unwrap()),
+                (instance.output_name(1).unwrap(), instance.output_shape(1).unwrap()),
+            ];
+            outputs.sort();
+            assert_eq!(outputs, [
+                ("boxes".to_string(), vec![1, 17640, 4]),
+                ("scores".to_string(), vec![1, 17640, 2]),
+            ]);
+            assert_eq!(instance.tensor_dtype("scores").unwrap(), Dtype::F32);
+
+            assert!(instance.input_name(1).is_err());
+            assert!(instance.output_shape(2).is_err());
+        }
+    }
+
+    hardware_test! {
+        fn tensorrt_infer_returns_outputs() {
+            let Some(engine) = tensorrt_engine() else { return };
+            let instance = engine.create_infer_instance(&sample_model(), None).unwrap();
+            instance.infer(&[sample_input()]).unwrap();
+            assert_sample_outputs(&instance.get_results().unwrap());
+        }
+    }
+
+    hardware_test! {
+        fn tensorrt_infer_async_returns_outputs() {
+            let Some(engine) = tensorrt_engine() else { return };
+            let instance = engine.create_infer_instance(&sample_model(), None).unwrap();
+            instance.infer_async(&[sample_input()]).unwrap();
+            instance.infer_async(&[sample_input()]).unwrap();
+            assert_sample_outputs(&instance.get_results().unwrap());
+            assert_sample_outputs(&instance.get_results().unwrap());
+        }
+    }
+
+    hardware_test! {
+        fn tensorrt_get_results_without_infer_fails() {
+            let Some(engine) = tensorrt_engine() else { return };
+            let instance = engine.create_infer_instance(&sample_model(), None).unwrap();
+            assert!(instance.get_results().is_err());
+        }
     }
 }
