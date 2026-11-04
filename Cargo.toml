@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "A Rust inference bridge with pluggable native backends (TensorRT, ONNX Runtime, OpenVINO)"
 license = "MIT"
+# build.rs downloads the prebuilt bridge from this repository's GitHub Releases.
+repository = "https://github.com/Subalzero/rsinference"
 
 [lib]
 name = "rsinference"
@@ -18,5 +20,18 @@ thiserror = "2"
 # Runtime symbol resolution against the C++ bridge DLL (no link-time dependency).
 libloading = "0.8"
 
+[features]
+# Enables the tests that run real inference. They need working hardware and drivers
+# (an NVIDIA GPU for TensorRT, a healthy CPU runtime for OpenVINO), which CI runners
+# lack, so they are ignored unless this feature is set:
+#   cargo test --features hardware-tests
+hardware-tests = []
+
 [build-dependencies]
 bindgen = "0.71"
+# Download, verify, and unpack the prebuilt bridge libraries (see build.rs).
+ureq = "3"
+sha2 = "0.11"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "9", default-features = false, features = ["deflate"] }

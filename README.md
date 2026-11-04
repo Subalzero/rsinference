@@ -2,10 +2,11 @@
 
 `rsinference` is a Rust API over a native inference bridge. The Rust crate
 loads the bridge library at runtime, while the bridge connects to the backend
-runtime. The repository currently implements the TensorRT bridge.
+runtime. The repository implements the TensorRT and OpenVINO bridges.
 
 ```text
-Rust application → rsinference → infertensorrt shared library → TensorRT → GPU
+Rust application → rsinference → infertensorrt shared library  → TensorRT → GPU
+                              └→ inferopenvino shared library → OpenVINO → CPU/GPU
 ```
 
 ## Project status
@@ -26,12 +27,35 @@ Building the Rust crate requires:
 - Rust and Cargo
 - C++ bridge header at `cpp/include/public/rsinference.h` (included here)
 - `libclang`/LLVM available to `bindgen`
-- A previously built `infertensorrt` shared library for runtime use
+- A previously built `infertensorrt` (and optionally `inferopenvino`) shared
+  library for runtime use, or a prebuilt one from a [release](#releases)
 
 Building the bridge requires CMake, a C++23 compiler, Ninja (for the presets),
-vcpkg dependencies, CUDA Toolkit, and TensorRT. The CMake project also requires
-OpenCV, Eigen3, and GoogleTest. The vendor SDKs and runtime libraries are not
-bundled with the Rust crate.
+vcpkg dependencies, CUDA Toolkit, and TensorRT. OpenVINO is optional: the
+`inferopenvino` bridge is built only when CMake finds it (pass `OPENVINO_DIR`).
+The CMake project also requires OpenCV, Eigen3, and GoogleTest. The vendor SDKs
+and runtime libraries are not bundled with the Rust crate.
+
+### Installing the native SDKs
+
+`scripts/install-deps.sh` (Ubuntu 24.04) and `scripts/install-deps.ps1`
+(Windows) download and install the SDKs the CI uses. Pass component names to
+install a subset (`cuda`, `tensorrt`, `openvino`, `toolchain`; default: all):
+
+```bash
+bash scripts/install-deps.sh cuda tensorrt openvino
+```
+
+```powershell
+./scripts/install-deps.ps1 cuda tensorrt openvino
+```
+
+They place TensorRT and OpenVINO under `DEPS_DIR` (default `$HOME/deps` on
+Linux, `C:\deps` on Windows) and print `CUDA_TOOLKIT_ROOT_DIR`, `TENSORRT_DIR`,
+`OPENVINO_DIR`, and `LIBCLANG_PATH` for the build. Versions can be overridden
+through environment variables; run either script with `-h`/`Get-Help` for the
+list. The Windows CUDA installer needs admin rights, and MSVC (Visual Studio
+Build Tools) is not installed by the script.
 
 ## Build C++ and Rust (Windows)
 
@@ -182,12 +206,15 @@ The public header `cpp/include/public/rsinference.h` is C-compatible and exports
 `rs_inference_abi_version()`. The Rust loader checks ABI version 1 before
 resolving the remaining bridge functions.
 
-TensorRT's own DLLs/shared libraries must also be discoverable by the process.
+TensorRT's and OpenVINO's own DLLs/shared libraries must also be discoverable
+by the process.
 Set `PATH` (Windows) or the platform's library search path before starting the
 application. On Windows, TensorRT and CUDA runtime DLLs usually need to be on
 `PATH` or beside the executable; placing them only beside the bridge DLL is
-not sufficient. Match the bridge, application, vendor runtime, and system
-architecture.
+not sufficient. For OpenVINO, add `runtime\bin\intel64\Release` and
+`runtime\3rdparty\tbb\bin` (Windows) or `runtime/lib/intel64` and
+`runtime/3rdparty/tbb/lib` (Linux) to the search path. Match the bridge,
+application, vendor runtime, and system architecture.
 
 ## Face detection example
 
@@ -202,8 +229,140 @@ README for build and runtime setup.
 The public error types are `EngineError` (bridge loading and runner creation),
 `InferError` (inference and tensor operations), and `DataError` (malformed
 native tensor data). They are non-exhaustive; downstream matches should include
-a catch-all arm. Requests for ONNX Runtime or OpenVINO currently return
-`UnsupportedBackend`.
+a catch-all arm. Requests for ONNX Runtime currently return
+`EngineError::UnsupportedBackend`. OpenVINO is implemented, but on a machine
+where its bridge was not built, `Engine::load` returns `EngineError::BridgeLoad`.
+
+## Testing
+
+```bash
+cargo test
+```
+
+Tests that run real inference need working hardware and drivers (an NVIDIA GPU
+for TensorRT, a healthy CPU runtime for OpenVINO). They are marked ignored
+unless the `hardware-tests` feature is enabled:
+
+```bash
+cargo test --features hardware-tests
+```
+
+On Windows, run with `-- --test-threads=1` as CI does. Outside CI, a hardware
+test whose bridge cannot be loaded prints a hint and is skipped; when the `CI`
+environment variable is set, a bridge that fails to load is a hard failure.
+The C++ bridge has its own GoogleTest suite, run with
+`ctest --test-dir cpp/build/<preset> --output-on-failure`.
+
+## Continuous integration
+
+`.github/workflows/develop.yml` runs on pushes to `develop` and on pull requests
+to `develop` and `master`. On Ubuntu 24.04 and Windows Server 2022 it installs
+the SDKs with `scripts/install-deps.*`, builds the C++ bridge and runs `ctest`,
+uploads the bridge libraries as the `bridge-linux` / `bridge-windows`
+artifacts, then builds and tests the Rust crate against them. GitHub-hosted
+runners have no GPU, so the hardware tests stay ignored there.
+
+To reproduce the CI jobs locally in Docker (the working tree, including
+uncommitted changes, is mounted read-only):
+
+```bash
+scripts/docker-ci.sh [all|cpp|rust] [--memory 6g] [--cpus N]
+```
+
+```powershell
+./scripts/docker-ci.ps1 -Job all   # Docker Desktop in Windows-containers mode
+```
+
+Bridge libraries produced by the container land in `scripts/docker-ci/out/bridge`.
+
+## Releases
+
+Pushing a tag matching `v*` (for example `v0.1.0`) runs
+`.github/workflows/release.yml`. It reuses the full `develop.yml` pipeline
+(bridge build, `ctest`, Rust build and tests on Linux and Windows), then
+attaches one archive per platform, plus a `SHA256SUMS` file, to a GitHub
+Release. Tags with a suffix, such as `v0.1.0-rc1`, are published as
+pre-releases, and the release notes list the PRs merged since the previous tag.
+
+The tag must be `v` followed by the `version` in `Cargo.toml` (and in
+`version.txt`), because `build.rs` builds the download URL from the crate
+version. A mismatched tag fails the workflow before anything is built. For a
+release candidate, set the version to `0.1.0-rc3` first, then tag `v0.1.0-rc3`.
+
+| Target | Archive |
+| --- | --- |
+| `x86_64-unknown-linux-gnu` | `rsinference-<tag>-x86_64-unknown-linux-gnu.tar.gz` |
+| `x86_64-pc-windows-msvc` | `rsinference-<tag>-x86_64-pc-windows-msvc.zip` |
+
+Each archive contains the prebuilt bridge libraries, the public C header, and
+this README:
+
+```text
+rsinference-<tag>-<target>/
+├── include/rsinference.h
+├── lib/                    libinfertensorrt.so, libinferopenvino.so  (Linux)
+│                           infertensorrt.dll,  inferopenvino.dll     (Windows)
+└── README.md
+```
+
+No Rust binaries are shipped. The Rust library is used from the same tag as a
+git dependency:
+
+```toml
+[dependencies]
+rsinference = { git = "https://github.com/Subalzero/rsinference", tag = "v0.1.0" }
+```
+
+### Using the crate: prebuilt bridge download
+
+You don't need to build the C++ bridge. When `cargo build` compiles
+`rsinference` and no bridge is available locally, `build.rs`:
+
+1. downloads `SHA256SUMS` and the archive for your target from the release
+   `v<crate version>`,
+2. checks the archive's SHA-256 against `SHA256SUMS` and refuses it on a
+   mismatch,
+3. unpacks it into Cargo's build directory (cached; later builds don't
+   download again), and
+4. copies the bridge libraries next to your executable, so `Engine::load`
+   finds them.
+
+Prebuilt bridges exist for `x86_64-unknown-linux-gnu` and
+`x86_64-pc-windows-msvc`. If the download fails, the build still succeeds
+with a warning, and the next build retries.
+
+| Environment variable | Effect |
+| --- | --- |
+| `INFERTENSORRT_BIN_DIR` | Use the bridge libraries in this directory; no download |
+| `RSINFERENCE_NO_DOWNLOAD=1` | Never download (offline or vendored builds) |
+| `RSINFERENCE_RELEASE_URL` | Download from this URL instead of the GitHub Release, e.g. a mirror with the same archives and `SHA256SUMS` |
+
+A local bridge build under `cpp/build/` (when working in this repository)
+also skips the download. To supply the bridge manually, extract a release
+archive and point `INFERTENSORRT_BIN_DIR` at its `lib` directory:
+
+```bash
+INFERTENSORRT_BIN_DIR=/path/to/rsinference-v0.1.0-x86_64-unknown-linux-gnu/lib cargo build
+```
+
+```powershell
+$env:INFERTENSORRT_BIN_DIR = 'C:\path\to\rsinference-v0.1.0-x86_64-pc-windows-msvc\lib'
+cargo build
+```
+
+`SHA256SUMS` comes from the same release as the archive, so it catches
+corrupted or swapped downloads, not a release whose files were all replaced.
+Turning on GitHub's immutable releases for the repository stops published
+assets from being changed afterwards.
+
+### What consumers must install
+
+- **CUDA, TensorRT, and OpenVINO runtimes:** not included in the archives.
+  Install them yourself (for example with `scripts/install-deps.*`) and make
+  them discoverable as described in
+  [Native library lookup](#native-library-lookup). On Linux, put their library
+  directories on `LD_LIBRARY_PATH`.
+- **`libclang`:** `bindgen` needs it to build the crate.
 
 ## License
 

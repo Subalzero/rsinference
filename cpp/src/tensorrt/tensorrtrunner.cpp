@@ -515,6 +515,8 @@ namespace rsinfer
 			}
 		}
 
+		if (index >= input_names.size())
+			throw std::out_of_range("Input tensor index is outside the engine's input tensors");
 		return input_names[index];
 	}
 
@@ -539,6 +541,8 @@ namespace rsinfer
 			}
 		}
 
+		if (index >= output_names.size())
+			throw std::out_of_range("Output tensor index is outside the engine's output tensors");
 		return output_names[index];
 	}
 

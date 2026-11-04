@@ -1,0 +1,22 @@
+# syntax=docker/dockerfile:1.4
+# Ubuntu 24.04 image approximating the GitHub ubuntu-24.04 runner for scripts/docker-ci.sh.
+# Build with: --build-context scripts=<repo>/scripts (see scripts/docker-ci.sh).
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive DEPS_DIR=/deps
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        sudo curl ca-certificates git rsync file \
+    && rm -rf /var/lib/apt/lists/*
+
+# Same step the workflow runs; the variables it exports land in /ci/github_env.
+COPY --from=scripts install-deps.sh /ci/install-deps.sh
+RUN mkdir -p /ci && sed -i 's/\r$//' /ci/install-deps.sh && touch /ci/github_env \
+    && GITHUB_ENV=/ci/github_env bash /ci/install-deps.sh \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+ENV PATH=/root/.cargo/bin:$PATH
+
+COPY run-ci.sh /ci/run-ci.sh
+RUN sed -i 's/\r$//' /ci/run-ci.sh && chmod +x /ci/run-ci.sh
+WORKDIR /work
