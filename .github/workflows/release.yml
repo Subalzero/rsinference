@@ -1,0 +1,89 @@
+name: Release
+
+# Push a tag like v0.1.0 to build the CLI together with the prebuilt C++ bridge
+# libraries and attach one archive per platform to a GitHub Release.
+on:
+  push:
+    tags: [ "v*" ]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Builds and tests the bridge; uploads bridge-linux / bridge-windows artifacts.
+  ci:
+    uses: ./.github/workflows/develop.yml
+
+  package:
+    name: Package (${{ matrix.target }})
+    needs: ci
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bridge: bridge-linux
+            exe: rsinference
+            archive: tar.gz
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            bridge: bridge-windows
+            exe: rsinference.exe
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner context is not available in job-level env, so set it from a step.
+      # Linux finds libclang on its own after the apt install below.
+      - name: Point bindgen at LLVM
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo 'LIBCLANG_PATH=C:\Program Files\LLVM\bin' >> "$GITHUB_ENV"
+
+      - name: Install libclang for bindgen
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libclang-dev clang
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.bridge }}
+          path: bridge
+
+      # The bridge is loaded at runtime, so release builds only need it for bindgen
+      # and for build.rs to copy it next to the exe.
+      - name: Build
+        shell: bash
+        env:
+          INFERTENSORRT_BIN_DIR: ${{ github.workspace }}/bridge
+        run: cargo build --release --locked
+
+      - name: Bundle
+        shell: bash
+        run: |
+          name="rsinference-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/release/${{ matrix.exe }}" "dist/$name/"
+          cp bridge/* "dist/$name/"
+          cp README.md LICENSE* "dist/$name/" 2>/dev/null || true
+          cd dist
+          if [ "${{ matrix.archive }}" = zip ]; then
+            7z a "$name.zip" "$name"
+            echo "ASSET=dist/$name.zip" >> "$GITHUB_ENV"
+          else
+            tar czf "$name.tar.gz" "$name"
+            echo "ASSET=dist/$name.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
