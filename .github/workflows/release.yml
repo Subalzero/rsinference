@@ -55,3 +55,5 @@ jobs:
             dist/*.zip
           # Tags with a suffix (v0.1.0-rc1) are marked as pre-releases.
           prerelease: ${{ contains(github.ref_name, '-') }}
+          # Lists the PRs merged since the previous tag as the release description.
+          generate_release_notes: true
