@@ -85,6 +85,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libclang-dev clang
 
+      # The bridge libraries link against these at load time, so the tests need them too.
+      - name: Install runtime dependencies (CUDA, TensorRT, OpenVINO)
+        run: bash scripts/install-deps.sh cuda tensorrt openvino
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -184,6 +188,11 @@ jobs:
       LIBCLANG_PATH: C:\Program Files\LLVM\bin
     steps:
       - uses: actions/checkout@v4
+
+      # The bridge DLLs load CUDA, TensorRT and OpenVINO DLLs from PATH (set via GITHUB_PATH).
+      - name: Install runtime dependencies (CUDA, TensorRT, OpenVINO)
+        shell: pwsh
+        run: ./scripts/install-deps.ps1 cuda tensorrt openvino
 
       - uses: dtolnay/rust-toolchain@stable
 

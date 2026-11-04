@@ -521,7 +521,12 @@ mod tests {
 
     #[test]
     fn load_missing_model_reports_error() {
-        let engine = Engine::load(EngineType::TensorRT).unwrap();
+        let Some(engine) = load_or_skip(
+            EngineType::TensorRT,
+            "put TensorRT's bin and the CUDA toolkit's bin on PATH (LD_LIBRARY_PATH on Linux)",
+        ) else {
+            return;
+        };
         let err = engine.create_infer_instance(&PathBuf::from("nonexistent.engine"), None).unwrap_err();
         assert!(matches!(err, EngineError::Load { .. }));
     }
@@ -546,20 +551,24 @@ mod tests {
 
     const OPENVINO_CPU: Option<&str> = Some(r#"{"device": "CPU"}"#);
 
-    /// Loads the OpenVINO bridge. Outside CI, a missing OpenVINO runtime skips the
-    /// test instead of failing it; in CI (where `CI` is set) it is a hard failure.
-    fn openvino_engine() -> Option<Engine> {
-        match Engine::load(EngineType::OpenVINO) {
+    /// Loads a backend's bridge. Outside CI, a missing runtime skips the test instead of
+    /// failing it; in CI (where `CI` is set) it is a hard failure.
+    fn load_or_skip(backend: EngineType, hint: &str) -> Option<Engine> {
+        match Engine::load(backend) {
             Ok(engine) => Some(engine),
             Err(EngineError::BridgeLoad { message, .. }) if std::env::var_os("CI").is_none() => {
-                eprintln!(
-                    "skipping: OpenVINO bridge did not load ({message}); put OpenVINO's \
-                     runtime\\bin\\intel64\\Release and runtime\\3rdparty\\tbb\\bin on PATH"
-                );
+                eprintln!("skipping: {backend:?} bridge did not load ({message}); {hint}");
                 None
             }
-            Err(err) => panic!("OpenVINO bridge did not load: {err:?}"),
+            Err(err) => panic!("{backend:?} bridge did not load: {err:?}"),
         }
+    }
+
+    fn openvino_engine() -> Option<Engine> {
+        load_or_skip(
+            EngineType::OpenVINO,
+            r"put OpenVINO's runtime\bin\intel64\Release and runtime\3rdparty\tbb\bin on PATH",
+        )
     }
 
     fn sample_model() -> PathBuf {
