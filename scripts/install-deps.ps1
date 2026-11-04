@@ -39,7 +39,15 @@ function Set-BuildVar([string] $Name, [string] $Value) {
 
 function Get-Download([string] $Url, [string] $Destination) {
     Write-Host "Downloading $Url"
-    Invoke-WebRequest -Uri $Url -OutFile $Destination -UseBasicParsing
+    # curl.exe with retries copes with the multi-GB archives better than Invoke-WebRequest.
+    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if ($curl) {
+        & $curl.Source -fL --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 30 -o $Destination $Url
+        if ($LASTEXITCODE -ne 0) { throw "Download failed with exit code ${LASTEXITCODE}: $Url" }
+    }
+    else {
+        Invoke-WebRequest -Uri $Url -OutFile $Destination -UseBasicParsing
+    }
 }
 
 function Expand-Into([string] $Archive, [string] $Destination) {
@@ -132,6 +140,10 @@ try {
         }
         # CMake looks for ${OPENVINO_DIR}/cmake, which lives under runtime/.
         Set-BuildVar 'OPENVINO_DIR' (Join-Path $ovRoot 'runtime')
+        if ($env:GITHUB_PATH) {
+            Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $ovRoot 'runtime\bin\intel64\Release')
+            Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $ovRoot 'runtime\3rdparty\tbb\bin')
+        }
     }
 }
 finally {

@@ -34,3 +34,5 @@ cpp/install
 # VSCode
 .vscode
 .cargo
+
+/scripts/docker-ci/out/

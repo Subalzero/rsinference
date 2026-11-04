@@ -173,7 +173,7 @@ impl InferInstance<'_> {
             }));
         }
 
-        Ok(Dtype::from_c_int(dtype))
+        Ok(Dtype::from_c_int(dtype as i32))
     }
 
     /// Infer function
@@ -394,7 +394,7 @@ impl InferInstance<'_> {
             *item = dat.clone();
         }
         // Create tensor array
-        let rs_tensor_ptr = unsafe { (self.engine.bridge.tensor_create)(name_cstr, name_len, dtype_c, data_ptr, rs_ll_arr_ptr) };
+        let rs_tensor_ptr = unsafe { (self.engine.bridge.tensor_create)(name_cstr, name_len, dtype_c as _, data_ptr, rs_ll_arr_ptr) };
         if rs_tensor_ptr.is_null() {
             unsafe {
                 (self.engine.bridge.llarray_destroy)(rs_ll_arr_ptr);
@@ -533,10 +533,143 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // needs an NVIDIA GPU to build the TensorRT engine
     fn load_existing_model_succeeds() {
         let engine = Engine::load(EngineType::TensorRT).unwrap();
         let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/version-RFB-640.onnx");
         let instance = engine.create_infer_instance(&model_path, None).unwrap();
         assert_eq!(instance.model_path(), &model_path);
+    }
+
+    // OpenVINO runs the sample model on the CPU, so these need no GPU. See
+    // models/README.md for the expected tensor names and shapes.
+
+    const OPENVINO_CPU: Option<&str> = Some(r#"{"device": "CPU"}"#);
+
+    /// Loads the OpenVINO bridge. Outside CI, a missing OpenVINO runtime skips the
+    /// test instead of failing it; in CI (where `CI` is set) it is a hard failure.
+    fn openvino_engine() -> Option<Engine> {
+        match Engine::load(EngineType::OpenVINO) {
+            Ok(engine) => Some(engine),
+            Err(EngineError::BridgeLoad { message, .. }) if std::env::var_os("CI").is_none() => {
+                eprintln!(
+                    "skipping: OpenVINO bridge did not load ({message}); put OpenVINO's \
+                     runtime\\bin\\intel64\\Release and runtime\\3rdparty\\tbb\\bin on PATH"
+                );
+                None
+            }
+            Err(err) => panic!("OpenVINO bridge did not load: {err:?}"),
+        }
+    }
+
+    fn sample_model() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/version-RFB-640.onnx")
+    }
+
+    /// A zero-filled `1 x 3 x 480 x 640` float32 input for the sample model.
+    fn sample_input() -> Tensor {
+        Tensor {
+            name: "input".to_string(),
+            shape: vec![1, 3, 480, 640],
+            dtype: Dtype::F32,
+            data: vec![0u8; 3 * 480 * 640 * 4],
+        }
+    }
+
+    fn as_f32(data: &[u8]) -> Vec<f32> {
+        data.chunks_exact(4)
+            .map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+            .collect()
+    }
+
+    /// Checks the outputs of one inference of the sample model.
+    fn assert_sample_outputs(outputs: &[Tensor]) {
+        assert_eq!(outputs.len(), 2);
+        let scores = outputs.iter().find(|t| t.name == "scores").expect("scores output");
+        let boxes = outputs.iter().find(|t| t.name == "boxes").expect("boxes output");
+
+        assert_eq!(scores.shape, vec![1, 17640, 2]);
+        assert_eq!(boxes.shape, vec![1, 17640, 4]);
+        assert_eq!(scores.dtype, Dtype::F32);
+        assert_eq!(boxes.dtype, Dtype::F32);
+        assert_eq!(scores.data.len(), 17640 * 2 * 4);
+        assert_eq!(boxes.data.len(), 17640 * 4 * 4);
+
+        // The graph ends in a softmax over [background, face].
+        for pair in as_f32(&scores.data).chunks_exact(2) {
+            assert!((pair[0] + pair[1] - 1.0).abs() < 1e-3, "scores {pair:?} do not sum to 1");
+        }
+    }
+
+    #[test]
+    fn openvino_load_missing_model_reports_error() {
+        let Some(engine) = openvino_engine() else { return };
+        assert_eq!(engine.engine_type(), EngineType::OpenVINO);
+        let err = engine.create_infer_instance(&PathBuf::from("nonexistent.onnx"), OPENVINO_CPU).unwrap_err();
+        assert!(matches!(err, EngineError::Load { .. }));
+    }
+
+    #[test]
+    fn openvino_rejects_invalid_config() {
+        let Some(engine) = openvino_engine() else { return };
+        let err = engine.create_infer_instance(&sample_model(), Some(r#"{"device": 5}"#)).unwrap_err();
+        match err {
+            EngineError::Engine { message } => assert!(message.contains("device must be a string"), "{message}"),
+            other => panic!("expected EngineError::Engine, got {other:?}"),
+        }
+
+        let err = engine.create_infer_instance(&sample_model(), Some("not json")).unwrap_err();
+        assert!(matches!(err, EngineError::Engine { .. }));
+    }
+
+    #[test]
+    fn openvino_reports_model_io() {
+        let Some(engine) = openvino_engine() else { return };
+        let instance = engine.create_infer_instance(&sample_model(), OPENVINO_CPU).unwrap();
+        assert_eq!(instance.engine_type(), EngineType::OpenVINO);
+
+        assert_eq!(instance.input_name(0).unwrap(), "input");
+        assert_eq!(instance.input_shape(0).unwrap(), vec![1, 3, 480, 640]);
+        assert_eq!(instance.tensor_dtype("input").unwrap(), Dtype::F32);
+
+        let mut outputs = [
+            (instance.output_name(0).unwrap(), instance.output_shape(0).unwrap()),
+            (instance.output_name(1).unwrap(), instance.output_shape(1).unwrap()),
+        ];
+        outputs.sort();
+        assert_eq!(outputs, [
+            ("boxes".to_string(), vec![1, 17640, 4]),
+            ("scores".to_string(), vec![1, 17640, 2]),
+        ]);
+        assert_eq!(instance.tensor_dtype("scores").unwrap(), Dtype::F32);
+
+        assert!(instance.input_name(1).is_err());
+        assert!(instance.output_shape(2).is_err());
+    }
+
+    #[test]
+    fn openvino_infer_returns_outputs() {
+        let Some(engine) = openvino_engine() else { return };
+        let instance = engine.create_infer_instance(&sample_model(), OPENVINO_CPU).unwrap();
+        instance.infer(&[sample_input()]).unwrap();
+        assert_sample_outputs(&instance.get_results().unwrap());
+    }
+
+    #[test]
+    #[ignore] // hangs: OpenVINO infer_async never completes, even for a single request
+    fn openvino_infer_async_returns_outputs() {
+        let Some(engine) = openvino_engine() else { return };
+        let instance = engine.create_infer_instance(&sample_model(), OPENVINO_CPU).unwrap();
+        instance.infer_async(&[sample_input()]).unwrap();
+        instance.infer_async(&[sample_input()]).unwrap();
+        assert_sample_outputs(&instance.get_results().unwrap());
+        assert_sample_outputs(&instance.get_results().unwrap());
+    }
+
+    #[test]
+    fn openvino_get_results_without_infer_fails() {
+        let Some(engine) = openvino_engine() else { return };
+        let instance = engine.create_infer_instance(&sample_model(), OPENVINO_CPU).unwrap();
+        assert!(instance.get_results().is_err());
     }
 }

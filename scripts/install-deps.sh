@@ -86,7 +86,11 @@ deps_dir="$(cd "$deps_dir" && pwd)"
 if want toolchain; then
   "${sudo_cmd[@]}" apt-get update
   apt_install build-essential gcc-14 g++-14 cmake ninja-build curl git pkg-config \
-    zip unzip tar ca-certificates libclang-dev clang \n    make autoconf autoconf-archive automake libtool m4 perl python3 bison flex \n    linux-libc-dev
+    zip unzip tar ca-certificates libclang-dev clang \
+    make autoconf autoconf-archive automake libtool m4 perl python3 bison flex \
+    linux-libc-dev \
+    libx11-dev libxft-dev libxext-dev libxi-dev libxrandr-dev libxtst-dev libxfixes-dev \
+    libxrender-dev libxcb1-dev libxau-dev libxdmcp-dev x11proto-dev xtrans-dev libltdl-dev
   # Newest libclang the distro ships; bindgen loads libclang.so from here.
   libclang_dir="$(dirname "$(ls /usr/lib/llvm-*/lib/libclang*.so* | sort -V | tail -n1)")"
   export_var LIBCLANG_PATH "$libclang_dir"

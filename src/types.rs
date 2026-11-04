@@ -90,7 +90,7 @@ impl Tensor {
                 .to_string_lossy()
                 .into_owned();
             tensor.shape = from_rs_infer_ll_array_ptr(&rs_tensor_ref.shape)?;
-            tensor.dtype = Dtype::from_c_int(rs_tensor_ref.dtype);
+            tensor.dtype = Dtype::from_c_int(rs_tensor_ref.dtype as i32);
 
             if !rs_tensor_ref.data.is_null() {
                 let data = &*rs_tensor_ref.data;
