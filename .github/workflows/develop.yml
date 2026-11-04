@@ -77,6 +77,9 @@ jobs:
     name: Rust (build + test)
     needs: cpp
     runs-on: ubuntu-24.04
+    env:
+      # Same location as the cpp job: the bridge's RUNPATH points at the OpenVINO install there.
+      DEPS_DIR: ${{ github.workspace }}/deps
     steps:
       - uses: actions/checkout@v4
 
@@ -106,7 +109,9 @@ jobs:
       - name: Test
         env:
           INFERTENSORRT_BIN_DIR: ${{ github.workspace }}/bridge
-        run: cargo test --verbose
+        run: |
+          export LD_LIBRARY_PATH="$TENSORRT_DIR/lib:$OPENVINO_DIR/lib/intel64:$CUDA_TOOLKIT_ROOT_DIR/lib64:${LD_LIBRARY_PATH:-}"
+          cargo test --verbose
 
   cpp-windows:
     name: C++ bridge (Windows, build + ctest)
@@ -184,6 +189,7 @@ jobs:
     name: Rust (Windows, build + test)
     needs: cpp-windows
     runs-on: windows-2022
+    timeout-minutes: 30
     env:
       LIBCLANG_PATH: C:\Program Files\LLVM\bin
     steps:
@@ -211,4 +217,4 @@ jobs:
       - name: Test
         env:
           INFERTENSORRT_BIN_DIR: ${{ github.workspace }}/bridge
-        run: cargo test --verbose
+        run: cargo test --verbose -- --test-threads=1

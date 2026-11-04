@@ -549,7 +549,10 @@ mod tests {
     // OpenVINO runs the sample model on the CPU, so these need no GPU. See
     // models/README.md for the expected tensor names and shapes.
 
-    const OPENVINO_CPU: Option<&str> = Some(r#"{"device": "CPU"}"#);
+    // One stream and one thread keep the tests cheap and avoid OpenVINO/TBB worker threads
+    // fighting each other when the tests run in parallel on a small CI runner.
+    const OPENVINO_CPU: Option<&str> =
+        Some(r#"{"device": "CPU", "num_streams": 1, "inference_num_threads": 1}"#);
 
     /// Loads a backend's bridge. Outside CI, a missing runtime skips the test instead of
     /// failing it; in CI (where `CI` is set) it is a hard failure.
@@ -665,7 +668,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // hangs: OpenVINO infer_async never completes, even for a single request
     fn openvino_infer_async_returns_outputs() {
         let Some(engine) = openvino_engine() else { return };
         let instance = engine.create_infer_instance(&sample_model(), OPENVINO_CPU).unwrap();
