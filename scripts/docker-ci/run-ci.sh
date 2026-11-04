@@ -41,6 +41,8 @@ export CARGO_TERM_COLOR=always
 
 # Variables the install-deps step exported (CUDA_TOOLKIT_ROOT_DIR, TENSORRT_DIR, LIBCLANG_PATH, ...).
 set -a; . <(sed "s/^/export /" /ci/github_env); set +a
+# Same loader path the workflow's test steps use.
+export LD_LIBRARY_PATH="$TENSORRT_DIR/lib:$OPENVINO_DIR/lib/intel64:$OPENVINO_DIR/3rdparty/tbb/lib:$CUDA_TOOLKIT_ROOT_DIR/lib64:${LD_LIBRARY_PATH:-}"
 
 if [[ "$job" == all || "$job" == cpp ]]; then
   export VCPKG_ROOT="$ws/cpp/thirdparty/vcpkg"
@@ -64,7 +66,6 @@ if [[ "$job" == all || "$job" == cpp ]]; then
   step 'Build' cmake --build "$BUILD_DIR"
 
   test_step() {
-    export LD_LIBRARY_PATH="$TENSORRT_DIR/lib:$OPENVINO_DIR/lib/intel64:$CUDA_TOOLKIT_ROOT_DIR/lib64:${LD_LIBRARY_PATH:-}"
     ctest --test-dir "$BUILD_DIR" --output-on-failure
   }
   step 'Test' test_step

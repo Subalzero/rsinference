@@ -58,7 +58,7 @@ jobs:
 
       - name: Test
         run: |
-          export LD_LIBRARY_PATH="$TENSORRT_DIR/lib:$OPENVINO_DIR/lib/intel64:$CUDA_TOOLKIT_ROOT_DIR/lib64:${LD_LIBRARY_PATH:-}"
+          export LD_LIBRARY_PATH="$TENSORRT_DIR/lib:$OPENVINO_DIR/lib/intel64:$OPENVINO_DIR/3rdparty/tbb/lib:$CUDA_TOOLKIT_ROOT_DIR/lib64:${LD_LIBRARY_PATH:-}"
           ctest --test-dir "$BUILD_DIR" --output-on-failure
 
       - name: Collect bridge libraries
@@ -110,7 +110,7 @@ jobs:
         env:
           INFERTENSORRT_BIN_DIR: ${{ github.workspace }}/bridge
         run: |
-          export LD_LIBRARY_PATH="$TENSORRT_DIR/lib:$OPENVINO_DIR/lib/intel64:$CUDA_TOOLKIT_ROOT_DIR/lib64:${LD_LIBRARY_PATH:-}"
+          export LD_LIBRARY_PATH="$TENSORRT_DIR/lib:$OPENVINO_DIR/lib/intel64:$OPENVINO_DIR/3rdparty/tbb/lib:$CUDA_TOOLKIT_ROOT_DIR/lib64:${LD_LIBRARY_PATH:-}"
           cargo test --verbose
 
   cpp-windows:
