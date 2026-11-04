@@ -533,11 +533,12 @@ mod tests {
         };
     }
 
-    #[test]
-    fn load_missing_model_reports_error() {
-        let Some(engine) = tensorrt_engine() else { return };
-        let err = engine.create_infer_instance(&PathBuf::from("nonexistent.engine"), None).unwrap_err();
-        assert!(matches!(err, EngineError::Load { .. }));
+    hardware_test! {
+        fn load_missing_model_reports_error() {
+            let Some(engine) = tensorrt_engine() else { return };
+            let err = engine.create_infer_instance(&PathBuf::from("nonexistent.engine"), None).unwrap_err();
+            assert!(matches!(err, EngineError::Load { .. }));
+        }
     }
 
     #[test]
@@ -559,10 +560,7 @@ mod tests {
     // OpenVINO runs the sample model on the CPU, so these need no GPU. See
     // models/README.md for the expected tensor names and shapes.
 
-    // One stream and one thread keep the tests cheap and avoid OpenVINO/TBB worker threads
-    // fighting each other when the tests run in parallel on a small CI runner.
-    const OPENVINO_CPU: Option<&str> =
-        Some(r#"{"device": "CPU", "num_streams": 1, "inference_num_threads": 1}"#);
+    const OPENVINO_CPU: Option<&str> = Some(r#"{"device": "CPU"}"#);
 
     /// Loads a backend's bridge. Outside CI, a missing runtime skips the test instead of
     /// failing it; in CI (where `CI` is set) it is a hard failure.
@@ -630,50 +628,53 @@ mod tests {
         }
     }
 
-    #[test]
-    fn openvino_load_missing_model_reports_error() {
-        let Some(engine) = openvino_engine() else { return };
-        assert_eq!(engine.engine_type(), EngineType::OpenVINO);
-        let err = engine.create_infer_instance(&PathBuf::from("nonexistent.onnx"), OPENVINO_CPU).unwrap_err();
-        assert!(matches!(err, EngineError::Load { .. }));
-    }
-
-    #[test]
-    fn openvino_rejects_invalid_config() {
-        let Some(engine) = openvino_engine() else { return };
-        let err = engine.create_infer_instance(&sample_model(), Some(r#"{"device": 5}"#)).unwrap_err();
-        match err {
-            EngineError::Engine { message } => assert!(message.contains("device must be a string"), "{message}"),
-            other => panic!("expected EngineError::Engine, got {other:?}"),
+    hardware_test! {
+        fn openvino_load_missing_model_reports_error() {
+            let Some(engine) = openvino_engine() else { return };
+            assert_eq!(engine.engine_type(), EngineType::OpenVINO);
+            let err = engine.create_infer_instance(&PathBuf::from("nonexistent.onnx"), OPENVINO_CPU).unwrap_err();
+            assert!(matches!(err, EngineError::Load { .. }));
         }
-
-        let err = engine.create_infer_instance(&sample_model(), Some("not json")).unwrap_err();
-        assert!(matches!(err, EngineError::Engine { .. }));
     }
 
-    #[test]
-    fn openvino_reports_model_io() {
-        let Some(engine) = openvino_engine() else { return };
-        let instance = engine.create_infer_instance(&sample_model(), OPENVINO_CPU).unwrap();
-        assert_eq!(instance.engine_type(), EngineType::OpenVINO);
+    hardware_test! {
+        fn openvino_rejects_invalid_config() {
+            let Some(engine) = openvino_engine() else { return };
+            let err = engine.create_infer_instance(&sample_model(), Some(r#"{"device": 5}"#)).unwrap_err();
+            match err {
+                EngineError::Engine { message } => assert!(message.contains("device must be a string"), "{message}"),
+                other => panic!("expected EngineError::Engine, got {other:?}"),
+            }
 
-        assert_eq!(instance.input_name(0).unwrap(), "input");
-        assert_eq!(instance.input_shape(0).unwrap(), vec![1, 3, 480, 640]);
-        assert_eq!(instance.tensor_dtype("input").unwrap(), Dtype::F32);
+            let err = engine.create_infer_instance(&sample_model(), Some("not json")).unwrap_err();
+            assert!(matches!(err, EngineError::Engine { .. }));
+        }
+    }
 
-        let mut outputs = [
-            (instance.output_name(0).unwrap(), instance.output_shape(0).unwrap()),
-            (instance.output_name(1).unwrap(), instance.output_shape(1).unwrap()),
-        ];
-        outputs.sort();
-        assert_eq!(outputs, [
-            ("boxes".to_string(), vec![1, 17640, 4]),
-            ("scores".to_string(), vec![1, 17640, 2]),
-        ]);
-        assert_eq!(instance.tensor_dtype("scores").unwrap(), Dtype::F32);
+    hardware_test! {
+        fn openvino_reports_model_io() {
+            let Some(engine) = openvino_engine() else { return };
+            let instance = engine.create_infer_instance(&sample_model(), OPENVINO_CPU).unwrap();
+            assert_eq!(instance.engine_type(), EngineType::OpenVINO);
 
-        assert!(instance.input_name(1).is_err());
-        assert!(instance.output_shape(2).is_err());
+            assert_eq!(instance.input_name(0).unwrap(), "input");
+            assert_eq!(instance.input_shape(0).unwrap(), vec![1, 3, 480, 640]);
+            assert_eq!(instance.tensor_dtype("input").unwrap(), Dtype::F32);
+
+            let mut outputs = [
+                (instance.output_name(0).unwrap(), instance.output_shape(0).unwrap()),
+                (instance.output_name(1).unwrap(), instance.output_shape(1).unwrap()),
+            ];
+            outputs.sort();
+            assert_eq!(outputs, [
+                ("boxes".to_string(), vec![1, 17640, 4]),
+                ("scores".to_string(), vec![1, 17640, 2]),
+            ]);
+            assert_eq!(instance.tensor_dtype("scores").unwrap(), Dtype::F32);
+
+            assert!(instance.input_name(1).is_err());
+            assert!(instance.output_shape(2).is_err());
+        }
     }
 
     // These run real inference, which hangs on runners without usable hardware/drivers.
@@ -697,11 +698,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn openvino_get_results_without_infer_fails() {
-        let Some(engine) = openvino_engine() else { return };
-        let instance = engine.create_infer_instance(&sample_model(), OPENVINO_CPU).unwrap();
-        assert!(instance.get_results().is_err());
+    hardware_test! {
+        fn openvino_get_results_without_infer_fails() {
+            let Some(engine) = openvino_engine() else { return };
+            let instance = engine.create_infer_instance(&sample_model(), OPENVINO_CPU).unwrap();
+            assert!(instance.get_results().is_err());
+        }
     }
 
     // TensorRT builds (or loads the cached) engine for the sample model, which needs an
