@@ -1,7 +1,9 @@
 name: Release
 
-# Push a tag like v0.1.0 to build the CLI together with the prebuilt C++ bridge
-# libraries and attach one archive per platform to a GitHub Release.
+# Push a tag like v0.1.0 to publish the prebuilt C++ bridge libraries and the public
+# C header as one archive per platform on a GitHub Release. The Rust crate itself is
+# consumed from the same tag as a git dependency, so no Rust binaries are shipped
+# (a compiled .rlib only works with the exact compiler that built it).
 on:
   push:
     tags: [ "v*" ]
@@ -9,81 +11,47 @@ on:
 permissions:
   contents: write
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  # Builds and tests the bridge; uploads bridge-linux / bridge-windows artifacts.
+  # Builds and tests the bridge and the Rust crate on Linux and Windows; uploads the
+  # bridge-linux / bridge-windows artifacts.
   ci:
     uses: ./.github/workflows/develop.yml
 
-  package:
-    name: Package (${{ matrix.target }})
+  publish:
+    name: Publish release
     needs: ci
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            bridge: bridge-linux
-            exe: rsinference
-            archive: tar.gz
-          - os: windows-2022
-            target: x86_64-pc-windows-msvc
-            bridge: bridge-windows
-            exe: rsinference.exe
-            archive: zip
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
-      # The runner context is not available in job-level env, so set it from a step.
-      # Linux finds libclang on its own after the apt install below.
-      - name: Point bindgen at LLVM
-        if: runner.os == 'Windows'
-        shell: bash
-        run: echo 'LIBCLANG_PATH=C:\Program Files\LLVM\bin' >> "$GITHUB_ENV"
-
-      - name: Install libclang for bindgen
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libclang-dev clang
-
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
+      # Downloads to bridge/bridge-linux and bridge/bridge-windows.
       - uses: actions/download-artifact@v4
         with:
-          name: ${{ matrix.bridge }}
+          pattern: bridge-*
           path: bridge
 
-      # The bridge is loaded at runtime, so release builds only need it for bindgen
-      # and for build.rs to copy it next to the exe.
-      - name: Build
-        shell: bash
-        env:
-          INFERTENSORRT_BIN_DIR: ${{ github.workspace }}/bridge
-        run: cargo build --release --locked
-
       - name: Bundle
-        shell: bash
         run: |
-          name="rsinference-${GITHUB_REF_NAME}-${{ matrix.target }}"
-          mkdir -p "dist/$name"
-          cp "target/release/${{ matrix.exe }}" "dist/$name/"
-          cp bridge/* "dist/$name/"
-          cp README.md LICENSE* "dist/$name/" 2>/dev/null || true
-          cd dist
-          if [ "${{ matrix.archive }}" = zip ]; then
-            7z a "$name.zip" "$name"
-            echo "ASSET=dist/$name.zip" >> "$GITHUB_ENV"
-          else
-            tar czf "$name.tar.gz" "$name"
-            echo "ASSET=dist/$name.tar.gz" >> "$GITHUB_ENV"
-          fi
+          bundle() { # <artifact> <target> <archive: tar.gz|zip>
+            name="rsinference-${GITHUB_REF_NAME}-$2"
+            mkdir -p "dist/$name/lib" "dist/$name/include"
+            cp "bridge/$1"/* "dist/$name/lib/"
+            cp cpp/include/public/rsinference.h "dist/$name/include/"
+            cp README.md "dist/$name/"
+            (
+              cd dist
+              if [ "$3" = zip ]; then zip -qr "$name.zip" "$name"; else tar czf "$name.tar.gz" "$name"; fi
+            )
+          }
+          bundle bridge-linux   x86_64-unknown-linux-gnu tar.gz
+          bundle bridge-windows x86_64-pc-windows-msvc   zip
+          ls -l dist
 
+      # One job publishes both archives, so the release is created exactly once.
       - uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ASSET }}
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+          # Tags with a suffix (v0.1.0-rc1) are marked as pre-releases.
+          prerelease: ${{ contains(github.ref_name, '-') }}

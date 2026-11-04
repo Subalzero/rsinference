@@ -278,20 +278,55 @@ Bridge libraries produced by the container land in `scripts/docker-ci/out/bridge
 ## Releases
 
 Pushing a tag matching `v*` (for example `v0.1.0`) runs
-`.github/workflows/release.yml`. It reuses the full `develop.yml` pipeline, then
-builds `rsinference` in release mode on each platform and attaches one archive
-per target to a GitHub Release:
+`.github/workflows/release.yml`. It reuses the full `develop.yml` pipeline
+(bridge build, `ctest`, Rust build and tests on Linux and Windows), then
+attaches one archive per platform to a GitHub Release. Tags with a suffix, such
+as `v0.1.0-rc1`, are published as pre-releases.
 
 | Target | Archive |
 | --- | --- |
 | `x86_64-unknown-linux-gnu` | `rsinference-<tag>-x86_64-unknown-linux-gnu.tar.gz` |
 | `x86_64-pc-windows-msvc` | `rsinference-<tag>-x86_64-pc-windows-msvc.zip` |
 
-Each archive contains the CLI, the prebuilt bridge libraries, and this README.
-CUDA, TensorRT, and OpenVINO are not included; install them (for example with
+Each archive contains the prebuilt bridge libraries, the public C header, and
+this README:
+
+```text
+rsinference-<tag>-<target>/
+├── include/rsinference.h
+├── lib/                    libinfertensorrt.so, libinferopenvino.so  (Linux)
+│                           infertensorrt.dll,  inferopenvino.dll     (Windows)
+└── README.md
+```
+
+No Rust binaries are shipped. The Rust library is used from the same tag as a
+git dependency, which saves you building the C++ bridge yourself:
+
+```toml
+[dependencies]
+rsinference = { git = "https://github.com/Subalzero/rsinference", tag = "v0.1.0" }
+```
+
+Download the archive for your platform, extract it, and point
+`INFERTENSORRT_BIN_DIR` at its `lib` directory when building your project.
+`build.rs` then copies the bridge libraries next to your executable so
+`Engine::load` finds them:
+
+```bash
+INFERTENSORRT_BIN_DIR=/path/to/rsinference-v0.1.0-x86_64-unknown-linux-gnu/lib cargo build
+```
+
+```powershell
+$env:INFERTENSORRT_BIN_DIR = 'C:\path\to\rsinference-v0.1.0-x86_64-pc-windows-msvc\lib'
+cargo build
+```
+
+Building the crate still needs `libclang` for `bindgen`. CUDA, TensorRT, and
+OpenVINO are not included; install them (for example with
 `scripts/install-deps.*`) and make them discoverable as described in
-[Native library lookup](#native-library-lookup). Keep the tag in step with the
-`version` in `Cargo.toml`.
+[Native library lookup](#native-library-lookup). On Linux, put the TensorRT,
+CUDA, and OpenVINO library directories on `LD_LIBRARY_PATH`. Keep the tag in
+step with the `version` in `Cargo.toml`.
 
 ## License
 
