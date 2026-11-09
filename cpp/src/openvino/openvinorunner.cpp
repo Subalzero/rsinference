@@ -89,7 +89,12 @@ namespace rsinfer
         }
     }
 
-    ov::Core OpenVINORunner::_core = ov::Core();
+    ov::Core& OpenVINORunner::core()
+    {
+        // Leaked on purpose: see the declaration in openvinorunner.h.
+        static ov::Core* instance = new ov::Core();
+        return *instance;
+    }
 
     OpenVINORunner::OpenVINORunner() = default;
 
@@ -108,8 +113,8 @@ namespace rsinfer
             throw std::invalid_argument("OpenVINO device must not be empty");
 
         std::shared_ptr<ov::Model> model = _params.modelWeightsPath.empty()
-            ? _core.read_model(_params.modelXmlPath)
-            : _core.read_model(_params.modelXmlPath, _params.modelWeightsPath);
+            ? core().read_model(_params.modelXmlPath)
+            : core().read_model(_params.modelXmlPath, _params.modelWeightsPath);
         ov::AnyMap compile_properties = _params.compileProperties;
         const auto add_property = [&compile_properties](const auto& property, const auto& value)
         {
@@ -131,7 +136,7 @@ namespace rsinfer
         add_property(ov::enable_profiling, _params.enableProfiling);
         add_property(ov::cache_dir, _params.cacheDir);
 
-        _compiled_model = _core.compile_model(model, _params.device, compile_properties);
+        _compiled_model = core().compile_model(model, _params.device, compile_properties);
 
         // The public Tensor adapter has a deliberately limited dtype enum.
         // Fail at model load instead of returning UNKNOWN or failing only when
@@ -442,11 +447,11 @@ namespace rsinfer
 
     std::vector<std::string> OpenVINORunner::get_available_devices()
     {
-        return _core.get_available_devices();
+        return core().get_available_devices();
     }
 
     std::string OpenVINORunner::get_device_name(const std::string& device)
     {
-        return _core.get_property(device, ov::device::full_name);
+        return core().get_property(device, ov::device::full_name);
     }
 }

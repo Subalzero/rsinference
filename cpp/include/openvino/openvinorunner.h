@@ -80,7 +80,11 @@ namespace rsinfer
         static std::string get_device_name(const std::string& device);
 
     private:
-        static ov::Core _core;
+        // Process-wide Core, intentionally never destroyed. A static ov::Core
+        // would be destroyed from DllMain(DLL_PROCESS_DETACH) under the loader
+        // lock; its destructor unloads device plugins (e.g. the GPU plugin) and
+        // joins their worker threads, which deadlocks on Windows.
+        static ov::Core& core();
 
         using Completion = std::variant<std::vector<rsinfer::Tensor>, std::string>;
 
