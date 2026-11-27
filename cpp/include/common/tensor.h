@@ -17,9 +17,16 @@
 namespace rsinfer {
 
     enum DataType {
-        FP16,
         FP32,
+        INT32,
+        INT64,
+        UINT8,
         INT8,
+        BOOL,
+        FP16,
+        FP8,     // E4M3
+        FP8E5M2,
+        E8M0,
         BF16,
         INT4,
         FP4,

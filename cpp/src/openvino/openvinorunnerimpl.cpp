@@ -1,5 +1,6 @@
 #include "rsinference.h"
 #include "openvinorunner.h"
+#include "common/datatypeconversion.h"
 
 #include <nlohmann/json.hpp>
 
@@ -38,26 +39,6 @@ namespace
         return static_cast<rsinfer::OpenVINORunner*>(runner->runner);
     }
 
-    size_t data_type_size(RSInferDataType type)
-    {
-        switch (type)
-        {
-        case RSInferDataType_Float32:
-        case RSInferDataType_Int32: return 4;
-        case RSInferDataType_Int64: return 8;
-        case RSInferDataType_UInt8:
-        case RSInferDataType_Bool: return 1;
-        case RSInferDataType_Half:
-        case RSInferDataType_BF16: return 2;
-        // The API reports packed 4-bit storage as two elements per byte,
-        // consistent with the TensorRT adapter.
-        case RSInferDataType_Int4:
-        case RSInferDataType_FP4: return 2;
-        case RSInferDataType_FP8:
-        case RSInferDataType_E8M0: return 1;
-        default: return 0;
-        }
-    }
 
     char* duplicate_string(const std::string& value)
     {
@@ -217,30 +198,10 @@ namespace
 
     rsinfer::DataType to_internal_type(RSInferDataType type)
     {
-        switch (type)
-        {
-        case RSInferDataType_Float32: return rsinfer::DataType::FP32;
-        case RSInferDataType_Half: return rsinfer::DataType::FP16;
-        case RSInferDataType_UInt8: return rsinfer::DataType::INT8;
-        case RSInferDataType_BF16: return rsinfer::DataType::BF16;
-        case RSInferDataType_Int4: return rsinfer::DataType::INT4;
-        case RSInferDataType_FP4: return rsinfer::DataType::FP4;
-        default: throw std::invalid_argument("OpenVINO Tensor adapter does not support this input data type");
-        }
-    }
-
-    RSInferDataType to_public_type(rsinfer::DataType type)
-    {
-        switch (type)
-        {
-        case rsinfer::DataType::FP32: return RSInferDataType_Float32;
-        case rsinfer::DataType::FP16: return RSInferDataType_Half;
-        case rsinfer::DataType::INT8: return RSInferDataType_UInt8;
-        case rsinfer::DataType::BF16: return RSInferDataType_BF16;
-        case rsinfer::DataType::INT4: return RSInferDataType_Int4;
-        case rsinfer::DataType::FP4: return RSInferDataType_FP4;
-        default: return RSInferDataType_Unknown;
-        }
+        const rsinfer::DataType internal = rsinfer::from_public_data_type(type);
+        if (internal == rsinfer::DataType::UNKNOWN)
+            throw std::invalid_argument("OpenVINO Tensor adapter does not support this input data type");
+        return internal;
     }
 
     std::vector<rsinfer::Tensor> make_inputs(const RSInferTensorArray* input_tensors)
@@ -302,7 +263,7 @@ namespace
             for (size_t dim = 0; dim < output.shape.size(); ++dim)
                 shape->data[dim] = static_cast<long long>(output.shape[dim]);
             array->tensors[i] = rs_infer_tensor_create(output.name.c_str(), output.name.size(),
-                to_public_type(output.dtype), data, shape);
+                rsinfer::to_public_data_type(output.dtype), data, shape);
             if (!array->tensors[i])
             {
                 set_error(error, ERROR_CODE_CREATION_FAILED, "Failed to allocate output tensor");
@@ -478,14 +439,15 @@ RSInferDataType rs_inference_runner_get_tensor_data_type(RSInferenceRunner* runn
         if (type == ov::element::f32) return RSInferDataType_Float32;
         if (type == ov::element::f16) return RSInferDataType_Half;
         if (type == ov::element::bf16) return RSInferDataType_BF16;
-        if (type == ov::element::i8) return RSInferDataType_UInt8;
+        if (type == ov::element::i8) return RSInferDataType_Int8;
         if (type == ov::element::i32) return RSInferDataType_Int32;
         if (type == ov::element::i64) return RSInferDataType_Int64;
         if (type == ov::element::u8) return RSInferDataType_UInt8;
         if (type == ov::element::boolean) return RSInferDataType_Bool;
         if (type == ov::element::i4) return RSInferDataType_Int4;
         if (type == ov::element::f4e2m1) return RSInferDataType_FP4;
-        if (type == ov::element::f8e4m3 || type == ov::element::f8e5m2) return RSInferDataType_FP8;
+        if (type == ov::element::f8e4m3) return RSInferDataType_FP8;
+        if (type == ov::element::f8e5m2) return RSInferDataType_FP8E5M2;
         if (type == ov::element::f8e8m0) return RSInferDataType_E8M0;
         return RSInferDataType_Unknown;
     }
@@ -501,7 +463,7 @@ size_t rs_inference_runner_get_tensor_data_size(RSInferenceRunner* runner, RSInf
     try
     {
         get_runner(runner);
-        const size_t size = data_type_size(data_type);
+        const size_t size = rsinfer::data_type_element_size(rsinfer::from_public_data_type(data_type));
         if (!size) set_error(error, ERROR_CODE_INVALID_ARGUMENTS, "Unsupported tensor data type");
         return size;
     }

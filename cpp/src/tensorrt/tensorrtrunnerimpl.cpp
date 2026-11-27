@@ -1,5 +1,6 @@
 #include "rsinference.h"
 #include "tensorrtrunner.h"
+#include "common/datatypeconversion.h"
 
 #include <fstream>
 #include <functional>
@@ -22,37 +23,6 @@ enum ErrorCodes
 
 using json = nlohmann::json;
 
-// The public C enum and the C++ rsinfer::DataType enum use different value
-// orders, so they must be translated rather than cast.
-static rsinfer::DataType to_rsinfer_data_type(RSInferDataType dtype)
-{
-    switch (dtype)
-    {
-    case RSInferDataType_Float32: return rsinfer::DataType::FP32;
-    case RSInferDataType_Half:    return rsinfer::DataType::FP16;
-    case RSInferDataType_BF16:    return rsinfer::DataType::BF16;
-    case RSInferDataType_Int4:    return rsinfer::DataType::INT4;
-    case RSInferDataType_FP4:     return rsinfer::DataType::FP4;
-    // The public enum has no signed 8-bit type; UInt8 is the only 8-bit slot.
-    case RSInferDataType_UInt8:   return rsinfer::DataType::INT8;
-    default:                      return rsinfer::DataType::UNKNOWN;
-    }
-}
-
-static RSInferDataType to_public_data_type(rsinfer::DataType dtype)
-{
-    switch (dtype)
-    {
-    case rsinfer::DataType::FP32: return RSInferDataType_Float32;
-    case rsinfer::DataType::FP16: return RSInferDataType_Half;
-    case rsinfer::DataType::BF16: return RSInferDataType_BF16;
-    case rsinfer::DataType::INT8: return RSInferDataType_UInt8;
-    case rsinfer::DataType::INT4: return RSInferDataType_Int4;
-    case rsinfer::DataType::FP4:  return RSInferDataType_FP4;
-    default:                      return RSInferDataType_Unknown;
-    }
-}
-
 static RSInferDataType tensorrt_data_type_to_public(nvinfer1::DataType dtype)
 {
     switch (dtype)
@@ -68,8 +38,7 @@ static RSInferDataType tensorrt_data_type_to_public(nvinfer1::DataType dtype)
     case nvinfer1::DataType::kINT64: return RSInferDataType_Int64;
     case nvinfer1::DataType::kINT4:  return RSInferDataType_Int4;
     case nvinfer1::DataType::kFP4:   return RSInferDataType_FP4;
-    // No signed 8-bit slot in the public enum; UInt8 is size-compatible.
-    case nvinfer1::DataType::kINT8:  return RSInferDataType_UInt8;
+    case nvinfer1::DataType::kINT8:  return RSInferDataType_Int8;
     default:                         return RSInferDataType_Unknown;
     }
 }
@@ -82,6 +51,7 @@ static bool public_data_type_to_tensorrt(RSInferDataType dtype, nvinfer1::DataTy
     case RSInferDataType_Int32:   result = nvinfer1::DataType::kINT32; return true;
     case RSInferDataType_Int64:   result = nvinfer1::DataType::kINT64; return true;
     case RSInferDataType_UInt8:   result = nvinfer1::DataType::kUINT8; return true;
+    case RSInferDataType_Int8:    result = nvinfer1::DataType::kINT8; return true;
     case RSInferDataType_Bool:    result = nvinfer1::DataType::kBOOL; return true;
     case RSInferDataType_Half:    result = nvinfer1::DataType::kHALF; return true;
     case RSInferDataType_FP8:     result = nvinfer1::DataType::kFP8; return true;
@@ -578,7 +548,7 @@ int rs_inference_runner_infer(RSInferenceRunner* runner, RSInferTensorArray* inp
             t.name = tensor->name;
             t.shape.assign(tensor->shape->data, tensor->shape->data + tensor->shape->length);
             t.data.assign(tensor->data->data, tensor->data->data + tensor->data->length);
-            t.dtype = to_rsinfer_data_type(tensor->dtype);
+            t.dtype = rsinfer::from_public_data_type(tensor->dtype);
             inputs.push_back(std::move(t));
         }
 
@@ -634,7 +604,7 @@ int rs_inference_runner_infer_async(RSInferenceRunner* runner, RSInferTensorArra
             t.name = tensor->name;
             t.shape.assign(tensor->shape->data, tensor->shape->data + tensor->shape->length);
             t.data.assign(tensor->data->data, tensor->data->data + tensor->data->length);
-            t.dtype = to_rsinfer_data_type(tensor->dtype);
+            t.dtype = rsinfer::from_public_data_type(tensor->dtype);
             inputs.push_back(std::move(t));
         }
 
@@ -711,7 +681,7 @@ RSInferTensorArray* rs_inference_runner_get_results(RSInferenceRunner* runner, R
             }
             for (size_t d = 0; d < tensor.shape.size(); ++d)
                 shape_array->data[d] = static_cast<long long>(tensor.shape[d]);
-            output_array->tensors[i] = rs_infer_tensor_create(tensor.name.c_str(), tensor.name.size(), to_public_data_type(tensor.dtype), data_array, shape_array);
+            output_array->tensors[i] = rs_infer_tensor_create(tensor.name.c_str(), tensor.name.size(), rsinfer::to_public_data_type(tensor.dtype), data_array, shape_array);
             if (!output_array->tensors[i])
             {
                 // `rs_infer_tensor_create` did not take ownership on failure.

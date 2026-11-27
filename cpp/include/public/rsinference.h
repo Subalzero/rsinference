@@ -20,7 +20,7 @@ extern "C" {
 #endif
 
 // Increment when a change alters public struct layout or function contracts.
-#define RSINFERENCE_ABI_VERSION 1u
+#define RSINFERENCE_ABI_VERSION 2u
 BACKEND_EXPORT unsigned int rs_inference_abi_version(void);
 
 typedef struct RSInferLLArray {
@@ -81,12 +81,18 @@ typedef enum RSInferDataType {
     RSInferDataType_UInt8 = 3,
     RSInferDataType_Bool = 4,
     RSInferDataType_Half = 5,
+    // 8-bit float, E4M3 layout (TensorRT kFP8, OpenVINO f8e4m3).
     RSInferDataType_FP8 = 6,
     RSInferDataType_E8M0 = 7,
     RSInferDataType_BF16 = 8,
+    // Packed 4-bit types: two elements share one byte, so n elements take
+    // (n + 1) / 2 bytes.
     RSInferDataType_Int4 = 9,
     RSInferDataType_FP4 = 10,
-    RSInferDataType_Unknown = 11
+    RSInferDataType_Int8 = 11,
+    // 8-bit float, E5M2 layout (OpenVINO f8e5m2).
+    RSInferDataType_FP8E5M2 = 12,
+    RSInferDataType_Unknown = 13
 } RSInferDataType;
 
 typedef struct RSInferTensor {
@@ -263,7 +269,9 @@ BACKEND_EXPORT RSInferDataType rs_inference_runner_get_tensor_data_type(RSInfere
  * @param runner: Pointer to the RSInferenceRunner instance from which to retrieve the data size.
  * @param data_type: The RSInferDataType for which to retrieve the size in bytes.
  * @param error: Pointer to an RSInferError structure to capture any errors during data size retrieval.
- * @return The size in bytes of the specified data type, or 0 if retrieval fails.
+ * @return The size in bytes of one element of the specified data type, or 0 if retrieval fails.
+ * Packed 4-bit types (Int4, FP4) report 1, their one-byte storage unit; a buffer of n such
+ * elements is (n + 1) / 2 bytes, not n * 1.
  * 
  * @attention THIS FUNCTION MUST BE THREAD-SAFE: It may be called from multiple threads concurrently, so ensure that your implementation is safe for concurrent execution.
  *

@@ -1,4 +1,5 @@
 #include "openvinorunner.h"
+#include "common/datatypeconversion.h"
 
 #include <cstring>
 #include <memory>
@@ -10,15 +11,20 @@ namespace rsinfer
 {
     namespace
     {
-        ov::element::Type to_ov_element_type(DataType data_type, ov::element::Type model_type)
+        ov::element::Type to_ov_element_type(DataType data_type)
         {
             switch (data_type)
             {
             case DataType::FP16: return ov::element::f16;
             case DataType::FP32: return ov::element::f32;
-            case DataType::INT8:
-                if (model_type == ov::element::i8 || model_type == ov::element::u8) return model_type;
-                return ov::element::i8;
+            case DataType::INT64: return ov::element::i64;
+            case DataType::INT32: return ov::element::i32;
+            case DataType::INT8: return ov::element::i8;
+            case DataType::UINT8: return ov::element::u8;
+            case DataType::BOOL: return ov::element::boolean;
+            case DataType::FP8: return ov::element::f8e4m3;
+            case DataType::FP8E5M2: return ov::element::f8e5m2;
+            case DataType::E8M0: return ov::element::f8e8m0;
             case DataType::BF16: return ov::element::bf16;
             case DataType::INT4: return ov::element::i4;
             case DataType::FP4: return ov::element::f4e2m1;
@@ -30,7 +36,14 @@ namespace rsinfer
         {
             if (type == ov::element::f16) return DataType::FP16;
             if (type == ov::element::f32) return DataType::FP32;
-            if (type == ov::element::i8 || type == ov::element::u8) return DataType::INT8;
+            if (type == ov::element::i32) return DataType::INT32;
+            if (type == ov::element::i64) return DataType::INT64;
+            if (type == ov::element::i8) return DataType::INT8;
+            if (type == ov::element::u8) return DataType::UINT8;
+            if (type == ov::element::boolean) return DataType::BOOL;
+            if (type == ov::element::f8e4m3) return DataType::FP8;
+            if (type == ov::element::f8e5m2) return DataType::FP8E5M2;
+            if (type == ov::element::f8e8m0) return DataType::E8M0;
             if (type == ov::element::bf16) return DataType::BF16;
             if (type == ov::element::i4) return DataType::INT4;
             if (type == ov::element::f4e2m1) return DataType::FP4;
@@ -39,16 +52,9 @@ namespace rsinfer
 
         size_t tensor_byte_count(DataType data_type, size_t element_count)
         {
-            switch (data_type)
-            {
-            case DataType::FP32: return element_count * sizeof(float);
-            case DataType::FP16:
-            case DataType::BF16: return element_count * sizeof(uint16_t);
-            case DataType::INT8: return element_count;
-            case DataType::INT4:
-            case DataType::FP4: return (element_count + 1) / 2;
-            default: throw std::invalid_argument("Unsupported OpenVINO tensor data type");
-            }
+            if (data_type_element_size(data_type) == 0)
+                throw std::invalid_argument("Unsupported OpenVINO tensor data type");
+            return packed_byte_count(data_type, element_count);
         }
 
         ov::Shape to_ov_shape(const std::vector<int64_t>& dims)
@@ -260,16 +266,9 @@ namespace rsinfer
 
     size_t OpenVINORunner::get_tensor_data_size(const rsinfer::DataType& data_type) const
     {
-        switch (data_type)
-        {
-        case DataType::FP32: return 4;
-        case DataType::FP16:
-        case DataType::BF16: return 2;
-        case DataType::INT8: return 1;
-        case DataType::INT4:
-        case DataType::FP4: return 2;
-        default: throw std::invalid_argument("Unsupported OpenVINO tensor data type");
-        }
+        const size_t size = data_type_element_size(data_type);
+        if (size == 0) throw std::invalid_argument("Unsupported OpenVINO tensor data type");
+        return size;
     }
 
     void OpenVINORunner::begin_request()
@@ -341,7 +340,7 @@ namespace rsinfer
             if (!port.get_partial_shape().compatible(ov::PartialShape(shape)))
                 throw std::invalid_argument("Input tensor shape does not match model input: " + port.get_any_name());
 
-            const ov::element::Type input_type = to_ov_element_type(input.dtype, port.get_element_type());
+            const ov::element::Type input_type = to_ov_element_type(input.dtype);
             if (input_type != port.get_element_type())
                 throw std::invalid_argument("Input tensor data type does not match model input: " + port.get_any_name());
             const size_t expected_bytes = tensor_byte_count(input.dtype, ov::shape_size(shape));
