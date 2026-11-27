@@ -23,6 +23,12 @@ namespace rsinfer
 			case nvinfer1::DataType::kFLOAT: return rsinfer::DataType::FP32;
 			case nvinfer1::DataType::kHALF:  return rsinfer::DataType::FP16;
 			case nvinfer1::DataType::kINT8:  return rsinfer::DataType::INT8;
+			case nvinfer1::DataType::kINT32: return rsinfer::DataType::INT32;
+			case nvinfer1::DataType::kBOOL:  return rsinfer::DataType::BOOL;
+			case nvinfer1::DataType::kUINT8: return rsinfer::DataType::UINT8;
+			case nvinfer1::DataType::kFP8:   return rsinfer::DataType::FP8;
+			case nvinfer1::DataType::kE8M0:  return rsinfer::DataType::E8M0;
+			case nvinfer1::DataType::kINT64: return rsinfer::DataType::INT64;
 			case nvinfer1::DataType::kBF16:  return rsinfer::DataType::BF16;
 			case nvinfer1::DataType::kINT4:  return rsinfer::DataType::INT4;
 			case nvinfer1::DataType::kFP4:   return rsinfer::DataType::FP4;
@@ -487,9 +493,10 @@ namespace rsinfer
 		case nvinfer1::DataType::kE8M0:       return 1;
 		case nvinfer1::DataType::kBF16:       return 2;
 		case nvinfer1::DataType::kINT64:      return 8;
-		// 4-bit types are packed: two elements per byte.
-		case nvinfer1::DataType::kINT4:       return 2;
-		case nvinfer1::DataType::kFP4:        return 2;
+		// 4-bit types are packed two elements per byte; report the one-byte
+		// storage unit, matching the public API contract.
+		case nvinfer1::DataType::kINT4:       return 1;
+		case nvinfer1::DataType::kFP4:        return 1;
 		default:                              return 0;
 		}
 	}
@@ -652,7 +659,10 @@ namespace rsinfer
 			context->setInputShape(tensor_name.c_str(), vector_to_dims(input_shape));
 
 			const nvinfer1::DataType engine_data_type = get_tensor_data_type(tensor_name);
-			assert(tensor.dtype == to_inferrs_data_type(engine_data_type));
+			if (tensor.dtype != to_inferrs_data_type(engine_data_type))
+			{
+				throw std::runtime_error("Input tensor '" + tensor_name + "' has a data type that does not match the engine");
+			}
 
 			size_t input_size = 1;
 			std::vector<int> input_dims = dims_to_vector(context->getTensorShape(tensor_name.c_str()));
@@ -666,7 +676,7 @@ namespace rsinfer
 			}
 
 			const size_t nbytes = samplesCommon::getNbBytes(engine_data_type, static_cast<int64_t>(input_size));
-			if (tensor.data.size() < nbytes)
+			if (tensor.data.size() != nbytes)
 			{
 				throw std::runtime_error("Input tensor '" + tensor_name + "' has " + std::to_string(tensor.data.size())
 					+ " bytes, expected " + std::to_string(nbytes));

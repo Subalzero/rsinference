@@ -358,6 +358,7 @@ if(BUILD_TESTING)
         add_executable(infertensorrt_tests ${INFERTENSORRT_TEST_SOURCES})
         target_include_directories(infertensorrt_tests
             PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include/public"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/include"
         )
         target_link_libraries(infertensorrt_tests
             PRIVATE infertensorrt GTest::gtest GTest::gtest_main

@@ -128,7 +128,7 @@ type FnIntarrayDestroy = unsafe extern "C" fn(array: *mut ffi::RSInferIntArray);
 type FnErrorCleanmsg = unsafe extern "C" fn(error: *mut ffi::RSInferError);
 type FnAbiVersion = unsafe extern "C" fn() -> u32;
 
-const SUPPORTED_BRIDGE_ABI_VERSION: u32 = 1;
+const SUPPORTED_BRIDGE_ABI_VERSION: u32 = 2;
 
 type FnTensorCreate = unsafe extern "C" fn(
     name: *const c_char,
