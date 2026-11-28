@@ -117,8 +117,25 @@ namespace rsinfer
 
     OpenVINORunner::~OpenVINORunner()
     {
-        std::unique_lock<std::mutex> lock(_completions_mut);
-        _completions_cond.wait(lock, [this]() { return _active_calls == 0; });
+        {
+            std::unique_lock<std::mutex> lock(_completions_mut);
+            _completions_cond.wait(lock, [this]() { return _active_calls == 0; });
+        }
+        // A callback may still be returning after it signalled completion;
+        // wait() only returns once the request has fully finished.
+        for (auto& slot : _slots)
+        {
+            if (!slot->started_async)
+                continue;
+            try
+            {
+                slot->request.wait();
+            }
+            catch (...)
+            {
+                // Its error was already reported through get().
+            }
+        }
     }
 
     OpenVINORunner::OpenVINORunner(const OpenVINORunnerParams& params)
@@ -176,50 +193,20 @@ namespace rsinfer
             : _params.numInferRequests;
         for (uint32_t i = 0; i < request_count; ++i)
         {
-            _infer_requests.push_back(_compiled_model.create_infer_request());
-        }
-        for (auto& request : _infer_requests)
-        {
-            _idle_requests.push(&request);
+            auto slot = std::make_unique<Slot>();
+            slot->owner = this;
+            slot->request = _compiled_model.create_infer_request();
+            slot->owned_inputs.resize(_compiled_model.inputs().size());
+            Slot* raw = slot.get();
+            slot->request.set_callback([raw](std::exception_ptr error) { raw->owner->on_async_complete(*raw, error); });
+            _idle_slots.push(raw);
+            _slots.push_back(std::move(slot));
         }
     }
 
     OpenVINORunner::OpenVINORunner(const std::string& xml_path, const std::string& default_device)
         : OpenVINORunner(make_params(xml_path, default_device))
     {
-    }
-
-    OpenVINORunner::OpenVINORunner(OpenVINORunner&& temp) noexcept
-    {
-        std::unique_lock<std::mutex> lock(temp._completions_mut);
-        temp._completions_cond.wait(lock, [&temp]() { return temp._active_calls == 0; });
-        _params = std::move(temp._params);
-        _compiled_model = std::move(temp._compiled_model);
-        _infer_requests = std::move(temp._infer_requests);
-        _idle_requests = std::move(temp._idle_requests);
-        _completions = std::exchange(temp._completions, Completions{});
-    }
-
-    OpenVINORunner& OpenVINORunner::operator=(OpenVINORunner&& temp) noexcept
-    {
-        if (this == &temp)
-            return *this;
-
-        {
-            std::unique_lock<std::mutex> lock(_completions_mut);
-            _completions_cond.wait(lock, [this]() { return _active_calls == 0; });
-        }
-        {
-            std::unique_lock<std::mutex> lock(temp._completions_mut);
-            temp._completions_cond.wait(lock, [&temp]() { return temp._active_calls == 0; });
-        }
-
-        _params = std::move(temp._params);
-        _compiled_model = std::move(temp._compiled_model);
-        _infer_requests = std::move(temp._infer_requests);
-        _idle_requests = std::move(temp._idle_requests);
-        _completions = std::exchange(temp._completions, Completions{});
-        return *this;
     }
 
     std::vector<int> OpenVINORunner::get_input_shape(uint32_t index) const
@@ -373,30 +360,47 @@ namespace rsinfer
         _completions_cond.notify_all();
     }
 
-    std::vector<rsinfer::Tensor> OpenVINORunner::process_impl(const std::vector<rsinfer::Tensor>& input_tensors)
+    OpenVINORunner::Slot* OpenVINORunner::acquire_slot()
+    {
+        Slot* slot = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(_idle_slots_mut);
+            if (_slots.empty())
+                throw std::runtime_error("OpenVINO runner has no infer requests");
+            _idle_slots_cond.wait(lock, [this]() { return !_idle_slots.empty(); });
+            slot = _idle_slots.front();
+            _idle_slots.pop();
+        }
+        // An async request hands its slot back from its callback, which may not
+        // have returned yet; until it has, the request reports itself busy.
+        if (slot->started_async)
+        {
+            try
+            {
+                slot->request.wait();
+            }
+            catch (...)
+            {
+                // Its error was already reported through get().
+            }
+            slot->started_async = false;
+        }
+        return slot;
+    }
+
+    void OpenVINORunner::return_slot(Slot* slot) noexcept
+    {
+        {
+            std::lock_guard<std::mutex> lock(_idle_slots_mut);
+            _idle_slots.push(slot);
+        }
+        _idle_slots_cond.notify_one();
+    }
+
+    void OpenVINORunner::bind_inputs(Slot& slot, std::span<const OpenVINOInputView> input_tensors, bool borrow)
     {
         if (input_tensors.size() != _compiled_model.inputs().size())
             throw std::invalid_argument("Input tensor count does not match the OpenVINO model");
-
-        ov::InferRequest* request = nullptr;
-        {
-            std::unique_lock<std::mutex> lock(_idle_requests_mut);
-            _idle_requests_cond.wait(lock, [this]() { return !_idle_requests.empty(); });
-            request = _idle_requests.front();
-            _idle_requests.pop();
-        }
-
-        struct RequestReturn
-        {
-            OpenVINORunner* runner;
-            ov::InferRequest* request;
-            ~RequestReturn()
-            {
-                std::lock_guard<std::mutex> lock(runner->_idle_requests_mut);
-                runner->_idle_requests.push(request);
-                runner->_idle_requests_cond.notify_one();
-            }
-        } return_request{ this, request };
 
         std::vector<bool> assigned(_compiled_model.inputs().size(), false);
         for (size_t input_pos = 0; input_pos < input_tensors.size(); ++input_pos)
@@ -406,9 +410,10 @@ namespace rsinfer
             if (!input.name.empty())
             {
                 port_index = _compiled_model.inputs().size();
+                const std::string name(input.name);
                 for (size_t i = 0; i < _compiled_model.inputs().size(); ++i)
                 {
-                    if (_compiled_model.input(i).get_names().count(input.name))
+                    if (_compiled_model.input(i).get_names().count(name))
                     {
                         port_index = i;
                         break;
@@ -416,32 +421,46 @@ namespace rsinfer
                 }
             }
             if (port_index >= _compiled_model.inputs().size() || assigned[port_index])
-                throw std::invalid_argument("Input tensor name is unknown or duplicated: " + input.name);
+                throw std::invalid_argument("Input tensor name is unknown or duplicated: " + std::string(input.name));
 
             const auto& port = _compiled_model.input(port_index);
-            const ov::Shape shape = to_ov_shape(input.shape);
-            if (!port.get_partial_shape().compatible(ov::PartialShape(shape)))
+            if (!port.get_partial_shape().compatible(ov::PartialShape(input.shape)))
                 throw std::invalid_argument("Input tensor shape does not match model input: " + port.get_any_name());
 
             const ov::element::Type input_type = to_ov_element_type(input.dtype);
             if (input_type != port.get_element_type())
                 throw std::invalid_argument("Input tensor data type does not match model input: " + port.get_any_name());
-            const size_t expected_bytes = tensor_byte_count(input.dtype, ov::shape_size(shape));
+            const size_t expected_bytes = tensor_byte_count(input.dtype, ov::shape_size(input.shape));
             if (input.data.size() != expected_bytes)
                 throw std::invalid_argument("Input tensor byte size does not match its shape: " + port.get_any_name());
 
-            ov::Tensor input_tensor(input_type, shape, const_cast<unsigned char*>(input.data.data()));
-            request->set_tensor(port, input_tensor);
+            if (borrow)
+            {
+                // The request only reads it, and only until infer() returns.
+                ov::Tensor input_tensor(input_type, input.shape, const_cast<unsigned char*>(input.data.data()));
+                slot.request.set_tensor(port, input_tensor);
+            }
+            else
+            {
+                ov::Tensor& owned = slot.owned_inputs[port_index];
+                if (!owned || owned.get_element_type() != input_type || owned.get_shape() != input.shape)
+                    owned = ov::Tensor(input_type, input.shape);
+                if (!input.data.empty())
+                    std::memcpy(owned.data(), input.data.data(), input.data.size());
+                slot.request.set_tensor(port, owned);
+            }
             assigned[port_index] = true;
         }
-        request->infer();
+    }
 
+    std::vector<rsinfer::Tensor> OpenVINORunner::collect_outputs(Slot& slot) const
+    {
         std::vector<rsinfer::Tensor> outputs;
         outputs.reserve(_compiled_model.outputs().size());
         for (size_t i = 0; i < _compiled_model.outputs().size(); ++i)
         {
             const auto& port = _compiled_model.output(i);
-            ov::Tensor output_tensor = request->get_tensor(port);
+            ov::Tensor output_tensor = slot.request.get_tensor(port);
             rsinfer::Tensor output;
             output.name = port.get_any_name();
             output.dtype = from_ov_element_type(output_tensor.get_element_type());
@@ -455,15 +474,38 @@ namespace rsinfer
         return outputs;
     }
 
+    std::vector<OpenVINOInputView> OpenVINORunner::views_of(const std::vector<rsinfer::Tensor>& tensors)
+    {
+        std::vector<OpenVINOInputView> views;
+        views.reserve(tensors.size());
+        for (const auto& t : tensors)
+            views.push_back({ t.name, to_ov_shape(t.shape), t.dtype, t.data });
+        return views;
+    }
+
     void OpenVINORunner::process(const std::vector<rsinfer::Tensor>& input_tensors)
     {
+        const auto views = views_of(input_tensors);
+        process(std::span<const OpenVINOInputView>(views));
+    }
+
+    void OpenVINORunner::process(std::span<const OpenVINOInputView> input_tensors)
+    {
         const uint64_t ticket = begin_request();
+        Slot* slot = nullptr;
         try
         {
-            complete_request(ticket, process_impl(input_tensors));
+            slot = acquire_slot();
+            bind_inputs(*slot, input_tensors, /*borrow=*/true);
+            slot->request.infer();
+            // Queue the result before freeing the request, as the async path does.
+            complete_request(ticket, collect_outputs(*slot));
+            return_slot(slot);
         }
         catch (...)
         {
+            if (slot)
+                return_slot(slot);
             // The error goes to this caller; get() skips the ticket.
             cancel_request(ticket);
             finish_request();
@@ -474,32 +516,65 @@ namespace rsinfer
 
     void OpenVINORunner::process_async(const std::vector<rsinfer::Tensor>& input_tensors)
     {
+        const auto views = views_of(input_tensors);
+        process_async(std::span<const OpenVINOInputView>(views));
+    }
+
+    void OpenVINORunner::process_async(std::span<const OpenVINOInputView> input_tensors)
+    {
         const uint64_t ticket = begin_request();
+        Slot* slot = nullptr;
         try
         {
-            std::thread([this, ticket](std::vector<rsinfer::Tensor> inputs)
-            {
-                try
-                {
-                    complete_request(ticket, process_impl(inputs));
-                }
-                catch (const std::exception& e)
-                {
-                    complete_request(ticket, std::string(e.what()));
-                }
-                catch (...)
-                {
-                    complete_request(ticket, std::string("unknown asynchronous inference failure"));
-                }
-                finish_request();
-            }, input_tensors).detach();
+            slot = acquire_slot();
+            bind_inputs(*slot, input_tensors, /*borrow=*/false);
+            slot->ticket = ticket;
+            slot->async_pending = true;
+            slot->started_async = true;
+            slot->request.start_async();
         }
         catch (...)
         {
+            if (slot)
+            {
+                slot->async_pending = false;
+                slot->started_async = false;
+                return_slot(slot);
+            }
             cancel_request(ticket);
             finish_request();
             throw;
         }
+    }
+
+    void OpenVINORunner::on_async_complete(Slot& slot, std::exception_ptr error) noexcept
+    {
+        // Runs on an OpenVINO thread when the request finishes.
+        if (!slot.async_pending)
+            return;
+        slot.async_pending = false;
+
+        Completion completion;
+        try
+        {
+            if (error)
+                std::rethrow_exception(error);
+            completion = collect_outputs(slot);
+        }
+        catch (const std::exception& e)
+        {
+            completion = std::string("OpenVINO asynchronous inference failed: ") + e.what();
+        }
+        catch (...)
+        {
+            completion = std::string("OpenVINO asynchronous inference failed");
+        }
+
+        // Queue the result before freeing the request (the ticket must be read
+        // before another request can take the slot).
+        complete_request(slot.ticket, std::move(completion));
+        return_slot(&slot);
+        finish_request();
     }
 
     void OpenVINORunner::get(std::vector<rsinfer::Tensor>& output_tensors)

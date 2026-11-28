@@ -910,6 +910,55 @@ mod tests {
         }
     }
 
+    /// Alternates synchronous and asynchronous calls on a single context /
+    /// infer request, so every call reuses the request the previous one just
+    /// released (including one whose completion callback may still be running).
+    fn assert_mixed_sync_async_on_one_request(engine: &Engine, config: &str) {
+        let fills = [0.0f32, 0.5, -0.25, 1.0];
+        let reference = engine.create_infer_instance(&sample_model(), None).unwrap();
+        let expected: Vec<Vec<Tensor>> = fills
+            .iter()
+            .map(|&fill| {
+                reference.infer(&[filled_input(fill)]).unwrap();
+                reference.get_results().unwrap()
+            })
+            .collect();
+
+        let single = engine.create_infer_instance(&sample_model(), Some(config)).unwrap();
+        for round in 0..5 {
+            for (i, &fill) in fills.iter().enumerate() {
+                if (i + round) % 2 == 0 {
+                    single.infer_async(&[filled_input(fill)]).unwrap();
+                } else {
+                    single.infer(&[filled_input(fill)]).unwrap();
+                }
+            }
+            for (i, want) in expected.iter().enumerate() {
+                let got = single.get_results().unwrap();
+                for (g, w) in got.iter().zip(want) {
+                    let (g, w) = (as_f32(&g.data), as_f32(&w.data));
+                    let max_diff = g.iter().zip(&w).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    assert!(max_diff < 1e-3, "round {round}: result {i} does not match its input (max diff {max_diff})");
+                }
+            }
+            assert!(single.get_results().is_err(), "no results should be left over");
+        }
+    }
+
+    hardware_test! {
+        fn tensorrt_mixed_sync_async_on_one_context() {
+            let Some(engine) = tensorrt_engine() else { return };
+            assert_mixed_sync_async_on_one_request(&engine, r#"{"n_contexts": 1}"#);
+        }
+    }
+
+    hardware_test! {
+        fn openvino_mixed_sync_async_on_one_request() {
+            let Some(engine) = openvino_engine() else { return };
+            assert_mixed_sync_async_on_one_request(&engine, r#"{"num_infer_requests": 1}"#);
+        }
+    }
+
     hardware_test! {
         fn tensorrt_async_results_follow_submission_order() {
             let Some(engine) = tensorrt_engine() else { return };

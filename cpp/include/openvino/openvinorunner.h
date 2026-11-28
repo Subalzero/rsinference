@@ -7,9 +7,12 @@
 #include <condition_variable>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <queue>
+#include <span>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 #include <mutex>
@@ -48,6 +51,18 @@ namespace rsinfer
         ov::AnyMap compileProperties;
     };
 
+    //! Borrowed view of one input tensor. process() runs inference directly on
+    //! `data`; process_async() copies it into the request's own buffer before
+    //! returning. Either way the caller may free it once the call returns.
+    //! An empty name matches the input at the view's position.
+    struct OpenVINOInputView
+    {
+        std::string_view name;
+        ov::Shape shape;
+        rsinfer::DataType dtype{ rsinfer::DataType::FP32 };
+        std::span<const unsigned char> data;
+    };
+
     class OpenVINORunner
     {
     public:
@@ -57,9 +72,10 @@ namespace rsinfer
         explicit OpenVINORunner(const OpenVINORunnerParams& params);
         OpenVINORunner(const std::string& xml_path, const std::string& default_device);
 
-        OpenVINORunner(OpenVINORunner&& temp) noexcept;
-        OpenVINORunner& operator=(OpenVINORunner&& temp) noexcept;
-
+        // Not copyable or movable: each infer request's completion callback
+        // points at its slot, which points back at this runner.
+        OpenVINORunner(OpenVINORunner&& temp) = delete;
+        OpenVINORunner& operator=(OpenVINORunner&& temp) = delete;
         OpenVINORunner(const OpenVINORunner& copy) = delete;
         OpenVINORunner& operator=(const OpenVINORunner& copy) = delete;
 
@@ -78,7 +94,13 @@ namespace rsinfer
 
         OpenVINORunnerParams get_config() const;
 
+        //! Runs inference on the caller's buffers (no input copy) and waits for it.
+        void process(std::span<const OpenVINOInputView> input_tensors);
         void process(const std::vector<rsinfer::Tensor>& input_tensors);
+        //! Validates the inputs, copies them into a free infer request's own
+        //! buffers and starts it with start_async before returning. Waits for a
+        //! free request when all of them are busy.
+        void process_async(std::span<const OpenVINOInputView> input_tensors);
         void process_async(const std::vector<rsinfer::Tensor>& input_tensors);
 
         void get(std::vector<rsinfer::Tensor>& output_tensors);
@@ -96,24 +118,48 @@ namespace rsinfer
         using Completions = OrderedCompletions<std::vector<rsinfer::Tensor>>;
         using Completion = Completions::Completion;
 
+        //! One infer request plus the input buffers it owns for async runs.
+        struct Slot
+        {
+            OpenVINORunner* owner{ nullptr };
+            ov::InferRequest request;
+            //! Per model input; reused while the shape and type stay the same.
+            std::vector<ov::Tensor> owned_inputs;
+            //! Ticket of the running async request. The completion callback only
+            //! acts while `async_pending` is set, so a callback raised by a
+            //! synchronous infer() (if the plugin does that) is ignored.
+            uint64_t ticket{ 0 };
+            bool async_pending{ false };
+            //! start_async was called since the slot was last waited on.
+            bool started_async{ false };
+        };
+
         //! Takes the request's completion ticket and counts it as an active call.
         uint64_t begin_request();
         void finish_request() noexcept;
         void complete_request(uint64_t ticket, Completion completion) noexcept;
         void cancel_request(uint64_t ticket) noexcept;
-        std::vector<rsinfer::Tensor> process_impl(const std::vector<rsinfer::Tensor>& input_tensors);
+
+        Slot* acquire_slot();
+        void return_slot(Slot* slot) noexcept;
+        //! Validates the inputs and binds them to the slot's request: wrapping
+        //! the caller's memory (borrow) or copying into the slot's own tensors.
+        void bind_inputs(Slot& slot, std::span<const OpenVINOInputView> input_tensors, bool borrow);
+        std::vector<rsinfer::Tensor> collect_outputs(Slot& slot) const;
+        void on_async_complete(Slot& slot, std::exception_ptr error) noexcept;
+        static std::vector<OpenVINOInputView> views_of(const std::vector<rsinfer::Tensor>& tensors);
 
         OpenVINORunnerParams _params;
 
         ov::CompiledModel _compiled_model;
 
-        std::vector<ov::InferRequest> _infer_requests;
-        std::queue<ov::InferRequest*> _idle_requests;
+        std::vector<std::unique_ptr<Slot>> _slots;
+        std::queue<Slot*> _idle_slots;
 
         Completions _completions; //!< Results in submission order; guarded by _completions_mut.
 
-        std::mutex _idle_requests_mut;
-        std::condition_variable _idle_requests_cond;
+        std::mutex _idle_slots_mut;
+        std::condition_variable _idle_slots_cond;
 
         std::mutex _completions_mut;
         std::condition_variable _completions_cond;

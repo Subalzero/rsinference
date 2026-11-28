@@ -31,6 +31,16 @@
   `enqueueV3`. The sync round trip is now 0.63 ms (p50), down from 0.93 ms, and
   async throughput with 4 contexts is ~1,700 req/s.
 
+- **OpenVINO runs inference on the caller's buffers.** `infer` wraps the
+  caller's input memory in `ov::Tensor`s directly (the bridge used to copy every
+  input first), and `infer_async` copies each input once into buffers owned by
+  the infer request, reused across calls, then runs it with `start_async` and a
+  completion callback instead of starting a thread per call and copying the
+  inputs again. On CPU with the sample model: sync `infer` + `get_results` p50
+  6.3 → 4.9 ms (`THROUGHPUT`, the default) and 3.5 → 2.2 ms (`LATENCY`); async
+  throughput with 4 in flight 274 → 463 req/s (`THROUGHPUT`) and 282 → 492
+  req/s with `num_infer_requests: 4`.
+
 ### New configuration
 
 - TensorRT `cuda_graph` (boolean, default `true`): set it to `false` to always
@@ -46,6 +56,14 @@
   more than one context outputs could be matched to the wrong inputs; on
   TensorRT this could even happen with one context when two threads raced.
   Calls that return an error themselves are skipped.
+
+### Behavior changes (OpenVINO)
+
+- `infer_async` validates its inputs before returning, so a wrong name, data
+  type, shape or size is reported by `infer_async` itself rather than by the
+  next `get_results`.
+- `infer_async` waits for a free infer request when all of them are busy,
+  instead of starting an unbounded number of threads.
 
 ### Behavior changes (TensorRT)
 
