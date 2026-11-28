@@ -12,6 +12,8 @@
 #include <cuda_runtime_api.h>
 #include <map>
 #include <optional>
+#include <span>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <expected>
@@ -68,6 +70,17 @@ namespace rsinfer
         std::map<std::string, ProfileDims> profile;
     };
 
+    //! Borrowed view of one input tensor. The runner reads `data` while the call
+    //! that receives the view runs (it copies the bytes into pinned memory before
+    //! returning, also for process_async), so the caller may free it afterwards.
+    struct TensorView
+    {
+        std::string_view name;
+        std::span<const int64_t> shape;
+        rsinfer::DataType dtype{ rsinfer::DataType::FP32 };
+        std::span<const unsigned char> data;
+    };
+
     class TensorRTRunner
     {
     public:
@@ -84,8 +97,13 @@ namespace rsinfer
 
         bool build(const std::function<bool(IOptimizationProfile*)>& optimization = {});
 
+        void process(std::span<const TensorView> input_tensors);
         void process(const std::vector<Tensor>& input_tensors);
 
+        //! Validates the inputs, copies them into an execution slot's pinned
+        //! buffers and queues the work on the slot's stream before returning.
+        //! Waits for a free slot when all n_contexts slots are busy.
+        void process_async(std::span<const TensorView> input_tensors);
         void process_async(const std::vector<Tensor>& input_tensors);
 
         void get(std::vector<Tensor>& result);
@@ -114,42 +132,71 @@ namespace rsinfer
         std::shared_ptr<nvinfer1::IRuntime> _runtime;   //!< The TensorRT runtime used to deserialize the engine
         std::shared_ptr<nvinfer1::ICudaEngine> _engine; //!< The TensorRT engine used to run the network
 
-        std::vector<std::unique_ptr<nvinfer1::IExecutionContext>> _execution_contexts;
-        std::queue<nvinfer1::IExecutionContext*> _idle_contexts;
-        std::queue<nvinfer1::IExecutionContext*> _busy_contexts;
+        //! One engine I/O tensor, in engine order.
+        struct IOTensor
+        {
+            std::string name;
+            bool is_input{ false };
+            nvinfer1::DataType type{ nvinfer1::DataType::kFLOAT };
+        };
+
+        //! Device buffer plus its pinned host staging buffer. Grown, never
+        //! shrunk, so steady-state requests do no allocation.
+        struct IOBuffer
+        {
+            void* device{ nullptr };
+            void* host{ nullptr };
+            size_t capacity{ 0 }; //!< Bytes allocated in both buffers.
+            size_t bytes{ 0 };    //!< Bytes used by the current request.
+            nvinfer1::Dims shape{}; //!< Resolved shape of the current request.
+        };
+
+        //! Everything one in-flight request needs: an execution context, its own
+        //! stream, and persistent buffers for every I/O tensor (indexed like _io).
+        struct Slot
+        {
+            TensorRTRunner* owner{ nullptr };
+            std::unique_ptr<nvinfer1::IExecutionContext> context;
+            cudaStream_t stream{ nullptr };
+            std::vector<IOBuffer> buffers;
+        };
+
+        std::vector<IOTensor> _io;
+        std::vector<size_t> _input_order;  //!< _io indices in get_input_tensor_name order.
+        std::vector<size_t> _output_order; //!< _io indices in get_output_tensor_name order.
+
+        std::vector<std::unique_ptr<Slot>> _slots;
+        std::queue<Slot*> _idle_slots;
+        std::mutex _idle_slots_mut;
+        std::condition_variable _idle_slots_cond;
+
         using Completion = std::variant<std::vector<Tensor>, std::string>;
         std::queue<Completion> _completions;
-
-        std::mutex _idle_contexts_mut;
-        std::mutex _busy_contexts_mut;
         std::mutex _completions_mut;
-
-        std::mutex _engine_mut;
-
-        std::condition_variable _idle_contexts_cond;
-        std::condition_variable _busy_contexts_cond;
         std::condition_variable _completions_cond;
         size_t _pending_requests{ 0 };
 
+        //! Requests whose stream callback has not run yet; the destructor waits for them.
         int _inflight = 0;
         std::mutex _inflight_mut;
         std::condition_variable _inflight_cond;
 
-        void process_impl(const std::vector<Tensor>& input_tensors);
+        bool init_slots();
+        void release_slots() noexcept;
+        Slot* acquire_slot();
+        void return_slot(Slot* slot) noexcept;
+        //! Validates the inputs and queues copy-in, execution and copy-out on a
+        //! slot's stream. Returns the slot, still owned by the caller.
+        Slot* enqueue(std::span<const TensorView> input_tensors);
+        void ensure_capacity(IOBuffer& buffer, size_t bytes);
+        std::vector<Tensor> collect_outputs(const Slot& slot) const;
+        void push_completion(Completion completion);
         void finish_request();
+        static void CUDART_CB on_stream_complete(cudaStream_t stream, cudaError_t status, void* user_data);
+        static std::vector<TensorView> views_of(const std::vector<Tensor>& tensors);
 
         bool construct_network(std::unique_ptr<nvinfer1::IBuilder>& builder, std::unique_ptr<nvinfer1::INetworkDefinition>& network, std::unique_ptr<nvinfer1::IBuilderConfig>& config,
             std::unique_ptr<nvonnxparser::IParser>& parser, std::unique_ptr<nvinfer1::ITimingCache>& timingCache);
-
-        //!
-        //! \brief Reads the input  and stores the result in a managed buffer
-        //!
-        bool process_input(const samplesCommon::BufferManager& buffers, nvinfer1::IExecutionContext* context, const std::vector<Tensor>& tensors);
-
-        //!
-        //! \brief Classifies digits and verify result
-        //!
-        bool verify_output(const samplesCommon::BufferManager& buffers, const nvinfer1::IExecutionContext* context);
 
         //!
         //! \brief Load plan file

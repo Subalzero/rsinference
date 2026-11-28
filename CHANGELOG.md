@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Performance
+
+- **TensorRT no longer allocates per inference.** Each execution context
+  (`n_contexts`) now owns a CUDA stream and persistent device buffers with
+  pinned host staging buffers, grown only when a dynamic input gets larger.
+  Inputs are read straight from the caller's `RSInferTensor` instead of being
+  copied into an intermediate tensor first, and requests run with
+  `cudaMemcpyAsync` + `enqueueV3` on the context's stream. On an RTX 5070 Ti
+  with the UltraFace RFB-640 model, a synchronous `infer` + `get_results`
+  dropped from 5.2 ms to 2.3 ms (p50); see `examples/latency.rs`.
+- **`infer_async` no longer starts a thread per call.** The work is queued on a
+  free context's stream and a stream callback collects the outputs.
+
+### Behavior changes (TensorRT)
+
+- `infer_async` validates its inputs before returning, so a wrong name, data
+  type, shape or size is reported by `infer_async` itself rather than by the
+  next `get_results`.
+- `infer_async` waits for a free execution context when all `n_contexts` are
+  busy, instead of starting an unbounded number of threads.
+- Input data is matched to engine inputs by tensor name. Previously the shape
+  was set by name but the data was copied by position, so inputs passed in a
+  different order than the engine's were mixed up.
+
 ## 0.2.0
 
 This release changes the C ABI. The bridge ABI version is now 2, so the Rust

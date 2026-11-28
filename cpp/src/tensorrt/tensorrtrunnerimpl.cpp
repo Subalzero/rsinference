@@ -13,6 +13,9 @@
 
 #include <nlohmann/json.hpp>
 
+// Input shapes (long long in the C ABI) are viewed in place as int64_t.
+static_assert(sizeof(long long) == sizeof(int64_t), "long long and int64_t must have the same size");
+
 enum ErrorCodes
 {
     ERROR_CODE_SUCCESS = 0,
@@ -701,7 +704,8 @@ int rs_inference_runner_infer(RSInferenceRunner* runner, RSInferTensorArray* inp
     try
     {
         auto tensorrtrunner = static_cast<rsinfer::TensorRTRunner*>(runner->runner);
-        std::vector<rsinfer::Tensor> inputs;
+        std::vector<rsinfer::TensorView> inputs;
+        inputs.reserve(input_tensors->length);
 
         for (size_t i = 0; i < input_tensors->length; ++i)
         {
@@ -719,15 +723,17 @@ int rs_inference_runner_infer(RSInferenceRunner* runner, RSInferTensorArray* inp
                 }
                 return ERROR_CODE_INVALID_ARGUMENTS;
             }
-            rsinfer::Tensor t;
-            t.name = tensor->name;
-            t.shape.assign(tensor->shape->data, tensor->shape->data + tensor->shape->length);
-            t.data.assign(tensor->data->data, tensor->data->data + tensor->data->length);
-            t.dtype = rsinfer::from_public_data_type(tensor->dtype);
-            inputs.push_back(std::move(t));
+            // Borrow the caller's buffers; the runner copies them into pinned
+            // memory before returning, so nothing here outlives this call.
+            rsinfer::TensorView view;
+            view.name = tensor->name ? std::string_view(tensor->name, tensor->name_length) : std::string_view{};
+            view.shape = std::span<const int64_t>(reinterpret_cast<const int64_t*>(tensor->shape->data), tensor->shape->length);
+            view.dtype = rsinfer::from_public_data_type(tensor->dtype);
+            view.data = std::span<const unsigned char>(tensor->data->data, tensor->data->length);
+            inputs.push_back(view);
         }
 
-        tensorrtrunner->process(inputs);
+        tensorrtrunner->process(std::span<const rsinfer::TensorView>(inputs));
 
         return ERROR_CODE_SUCCESS;
     }
@@ -757,7 +763,8 @@ int rs_inference_runner_infer_async(RSInferenceRunner* runner, RSInferTensorArra
     try
     {
         auto tensorrtrunner = static_cast<rsinfer::TensorRTRunner*>(runner->runner);
-        std::vector<rsinfer::Tensor> inputs;
+        std::vector<rsinfer::TensorView> inputs;
+        inputs.reserve(input_tensors->length);
 
         for (size_t i = 0; i < input_tensors->length; ++i)
         {
@@ -775,15 +782,17 @@ int rs_inference_runner_infer_async(RSInferenceRunner* runner, RSInferTensorArra
                 }
                 return ERROR_CODE_INVALID_ARGUMENTS;
             }
-            rsinfer::Tensor t;
-            t.name = tensor->name;
-            t.shape.assign(tensor->shape->data, tensor->shape->data + tensor->shape->length);
-            t.data.assign(tensor->data->data, tensor->data->data + tensor->data->length);
-            t.dtype = rsinfer::from_public_data_type(tensor->dtype);
-            inputs.push_back(std::move(t));
+            // Borrow the caller's buffers; the runner copies them into pinned
+            // memory before returning, so nothing here outlives this call.
+            rsinfer::TensorView view;
+            view.name = tensor->name ? std::string_view(tensor->name, tensor->name_length) : std::string_view{};
+            view.shape = std::span<const int64_t>(reinterpret_cast<const int64_t*>(tensor->shape->data), tensor->shape->length);
+            view.dtype = rsinfer::from_public_data_type(tensor->dtype);
+            view.data = std::span<const unsigned char>(tensor->data->data, tensor->data->length);
+            inputs.push_back(view);
         }
 
-        tensorrtrunner->process_async(inputs);
+        tensorrtrunner->process_async(std::span<const rsinfer::TensorView>(inputs));
 
         return ERROR_CODE_SUCCESS;
     }
