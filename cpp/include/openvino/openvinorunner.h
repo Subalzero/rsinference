@@ -30,7 +30,10 @@ namespace rsinfer
         uint32_t numInferRequests{ 0 }; //!< 0 uses OpenVINO's optimal request count.
 
         // Portable performance and execution hints.
-        std::optional<ov::hint::PerformanceMode> performanceMode{ ov::hint::PerformanceMode::THROUGHPUT };
+        //! LATENCY gives each request the whole device, which is fastest for
+        //! single calls; THROUGHPUT splits it into streams for many concurrent
+        //! requests (pair it with a higher num_infer_requests).
+        std::optional<ov::hint::PerformanceMode> performanceMode{ ov::hint::PerformanceMode::LATENCY };
         std::optional<ov::element::Type> inferencePrecision{ ov::element::f32 };
         std::optional<ov::hint::ExecutionMode> executionMode;
         std::optional<ov::hint::Priority> modelPriority;

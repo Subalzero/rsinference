@@ -37,7 +37,7 @@
   the infer request, reused across calls, then runs it with `start_async` and a
   completion callback instead of starting a thread per call and copying the
   inputs again. On CPU with the sample model: sync `infer` + `get_results` p50
-  6.3 → 4.9 ms (`THROUGHPUT`, the default) and 3.5 → 2.2 ms (`LATENCY`); async
+  6.3 → 4.9 ms (`THROUGHPUT`, the previous default) and 3.5 → 2.2 ms (`LATENCY`); async
   throughput with 4 in flight 274 → 463 req/s (`THROUGHPUT`) and 282 → 492
   req/s with `num_infer_requests: 4`.
 
@@ -58,6 +58,13 @@
   Calls that return an error themselves are skipped.
 
 ### Behavior changes (OpenVINO)
+
+- **The default `performance_mode` is now `LATENCY`** (it was `THROUGHPUT`).
+  Each request gets the whole device, so a single synchronous call is about 2×
+  faster on CPU (2.2 ms vs 4.9 ms p50 for the sample model). OpenVINO then
+  suggests a single infer request, so async calls run one at a time unless
+  `num_infer_requests` is set. For many concurrent requests, set
+  `"performance_mode": "THROUGHPUT"` to get the old behavior.
 
 - `infer_async` validates its inputs before returning, so a wrong name, data
   type, shape or size is reported by `infer_async` itself rather than by the
