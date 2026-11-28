@@ -12,6 +12,7 @@
 #include <variant>
 #include <vector>
 #include <mutex>
+#include <expected>
 
 #include "openvino/openvino.hpp"
 
@@ -70,6 +71,11 @@ namespace rsinfer
         ov::element::Type get_tensor_element_type(const std::string& tensor_name) const;
         rsinfer::DataType get_tensor_data_type(const std::string& tensor_name) const;
         size_t get_tensor_data_size(const rsinfer::DataType& data_type) const;
+
+        std::expected<std::vector<rsinfer::Tensor>, std::string> get_input_tensors_info() const;
+        std::expected<std::vector<rsinfer::Tensor>, std::string> get_output_tensors_info() const;
+
+        OpenVINORunnerParams get_config() const;
 
         void process(const std::vector<rsinfer::Tensor>& input_tensors);
         void process_async(const std::vector<rsinfer::Tensor>& input_tensors);

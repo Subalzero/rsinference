@@ -196,6 +196,80 @@ namespace
         return {};
     }
 
+    //! Inverse of parse_config: emits the same keys so the result can be fed
+    //! back to rs_inference_runner_create. Unset optional settings are omitted.
+    json config_to_json(const rsinfer::OpenVINORunnerParams& params)
+    {
+        json j = json::object();
+        j["device"] = params.device;
+        if (!params.modelWeightsPath.empty()) j["model_weights_path"] = params.modelWeightsPath;
+        if (params.cacheDir) j["cache_dir"] = *params.cacheDir;
+        j["num_infer_requests"] = params.numInferRequests;
+
+        if (params.performanceMode)
+        {
+            switch (*params.performanceMode)
+            {
+            case ov::hint::PerformanceMode::LATENCY: j["performance_mode"] = "LATENCY"; break;
+            case ov::hint::PerformanceMode::THROUGHPUT: j["performance_mode"] = "THROUGHPUT"; break;
+            case ov::hint::PerformanceMode::CUMULATIVE_THROUGHPUT: j["performance_mode"] = "CUMULATIVE_THROUGHPUT"; break;
+            default: break;
+            }
+        }
+        if (params.inferencePrecision) j["inference_precision"] = params.inferencePrecision->get_type_name();
+        if (params.executionMode)
+            j["execution_mode"] = *params.executionMode == ov::hint::ExecutionMode::ACCURACY ? "ACCURACY" : "PERFORMANCE";
+        if (params.modelPriority)
+        {
+            switch (*params.modelPriority)
+            {
+            case ov::hint::Priority::LOW: j["model_priority"] = "LOW"; break;
+            case ov::hint::Priority::MEDIUM: j["model_priority"] = "MEDIUM"; break;
+            case ov::hint::Priority::HIGH: j["model_priority"] = "HIGH"; break;
+            default: break;
+            }
+        }
+        if (params.performanceHintNumRequests) j["performance_hint_num_requests"] = *params.performanceHintNumRequests;
+
+        if (params.numStreams)
+        {
+            const int32_t n = params.numStreams->num;
+            if (n == ov::streams::AUTO.num) j["num_streams"] = "AUTO";
+            else if (n == ov::streams::NUMA.num) j["num_streams"] = "NUMA";
+            else j["num_streams"] = n;
+        }
+        if (params.inferenceNumThreads) j["inference_num_threads"] = *params.inferenceNumThreads;
+        if (params.compilationNumThreads) j["compilation_num_threads"] = *params.compilationNumThreads;
+        if (params.schedulingCoreType)
+        {
+            switch (*params.schedulingCoreType)
+            {
+            case ov::hint::SchedulingCoreType::ANY_CORE: j["scheduling_core_type"] = "ANY_CORE"; break;
+            case ov::hint::SchedulingCoreType::PCORE_ONLY: j["scheduling_core_type"] = "PCORE_ONLY"; break;
+            case ov::hint::SchedulingCoreType::ECORE_ONLY: j["scheduling_core_type"] = "ECORE_ONLY"; break;
+            default: break;
+            }
+        }
+        if (params.enableCpuPinning) j["enable_cpu_pinning"] = *params.enableCpuPinning;
+        if (params.enableHyperThreading) j["enable_hyper_threading"] = *params.enableHyperThreading;
+        if (params.enableProfiling) j["enable_profiling"] = *params.enableProfiling;
+
+        if (!params.compileProperties.empty())
+        {
+            json props = json::object();
+            for (const auto& [key, value] : params.compileProperties)
+            {
+                if (value.is<bool>()) props[key] = value.as<bool>();
+                else if (value.is<uint64_t>()) props[key] = value.as<uint64_t>();
+                else if (value.is<int64_t>()) props[key] = value.as<int64_t>();
+                else if (value.is<double>()) props[key] = value.as<double>();
+                else props[key] = value.as<std::string>(); // strings, and anything printable
+            }
+            j["compile_properties"] = std::move(props);
+        }
+        return j;
+    }
+
     rsinfer::DataType to_internal_type(RSInferDataType type)
     {
         const rsinfer::DataType internal = rsinfer::from_public_data_type(type);
@@ -378,124 +452,78 @@ RSInferTensorArray* rs_inference_runner_get_results(RSInferenceRunner* runner, R
     }
 }
 
-RSInferIntArray* rs_inference_runner_get_input_shape(RSInferenceRunner* runner, unsigned index, RSInferError* error)
+RSInferTensorArray* rs_inference_runner_get_input_tensors_info(RSInferenceRunner* runner, RSInferError* error)
 {
     try
     {
-        const auto shape = get_runner(runner)->get_input_shape(index);
-        RSInferIntArray* result = rs_infer_intarray_create(shape.size());
-        if (!result)
+        auto* backend = get_runner(runner);
+        const auto infos = backend->get_input_tensors_info();
+        if (!infos.has_value())
         {
-            set_error(error, ERROR_CODE_CREATION_FAILED, "Failed to allocate OpenVINO input shape");
+            set_error(error, ERROR_CODE_INFERENCE_FAILED, "Failed to get OpenVINO input tensors info: " + infos.error());
             return nullptr;
         }
-        for (size_t i = 0; i < shape.size(); ++i)
-        {
-            result->data[i] = shape[i];
-        }
-        return result;
+        // Info tensors carry name, dtype and shape only; their data arrays are empty.
+        // Dynamic dimensions are reported as -1.
+        return make_output(infos.value(), error);
     }
-    catch (const std::exception& e)
-    {
-        set_error(error, ERROR_CODE_INFERENCE_FAILED, std::string("Failed to get OpenVINO input shape: ") + e.what());
-        return nullptr;
-    }
-}
-
-RSInferIntArray* rs_inference_runner_get_output_shape(RSInferenceRunner* runner, unsigned index, RSInferError* error)
-{
-    try
-    {
-        const auto shape = get_runner(runner)->get_output_shape(index);
-        RSInferIntArray* result = rs_infer_intarray_create(shape.size());
-        if (!result)
-        {
-            set_error(error, ERROR_CODE_CREATION_FAILED, "Failed to allocate OpenVINO output shape");
-            return nullptr;
-        }
-        for (size_t i = 0; i < shape.size(); ++i)
-        {
-            result->data[i] = shape[i];
-        }
-        return result;
-    }
-    catch (const std::exception& e)
-    {
-        set_error(error, ERROR_CODE_INFERENCE_FAILED, std::string("Failed to get OpenVINO output shape: ") + e.what());
-        return nullptr;
-    }
-}
-
-RSInferDataType rs_inference_runner_get_tensor_data_type(RSInferenceRunner* runner, const char* tensor_name, RSInferError* error)
-{
-    if (!tensor_name)
-    {
-        set_error(error, ERROR_CODE_INVALID_ARGUMENTS, "Tensor name cannot be null");
-        return RSInferDataType_Unknown;
-    }
-    try
-    {
-        const auto type = get_runner(runner)->get_tensor_element_type(tensor_name);
-        if (type == ov::element::f32) return RSInferDataType_Float32;
-        if (type == ov::element::f16) return RSInferDataType_Half;
-        if (type == ov::element::bf16) return RSInferDataType_BF16;
-        if (type == ov::element::i8) return RSInferDataType_Int8;
-        if (type == ov::element::i32) return RSInferDataType_Int32;
-        if (type == ov::element::i64) return RSInferDataType_Int64;
-        if (type == ov::element::u8) return RSInferDataType_UInt8;
-        if (type == ov::element::boolean) return RSInferDataType_Bool;
-        if (type == ov::element::i4) return RSInferDataType_Int4;
-        if (type == ov::element::f4e2m1) return RSInferDataType_FP4;
-        if (type == ov::element::f8e4m3) return RSInferDataType_FP8;
-        if (type == ov::element::f8e5m2) return RSInferDataType_FP8E5M2;
-        if (type == ov::element::f8e8m0) return RSInferDataType_E8M0;
-        return RSInferDataType_Unknown;
-    }
-    catch (const std::exception& e)
-    {
-        set_error(error, ERROR_CODE_INFERENCE_FAILED, std::string("Failed to get OpenVINO tensor data type: ") + e.what());
-        return RSInferDataType_Unknown;
-    }
-}
-
-size_t rs_inference_runner_get_tensor_data_size(RSInferenceRunner* runner, RSInferDataType data_type, RSInferError* error)
-{
-    try
-    {
-        get_runner(runner);
-        const size_t size = rsinfer::data_type_element_size(rsinfer::from_public_data_type(data_type));
-        if (!size) set_error(error, ERROR_CODE_INVALID_ARGUMENTS, "Unsupported tensor data type");
-        return size;
-    }
-    catch (const std::exception& e)
+    catch (const std::invalid_argument& e)
     {
         set_error(error, ERROR_CODE_INVALID_ARGUMENTS, e.what());
-        return 0;
-    }
-}
-
-const char* rs_inference_runner_get_input_tensor_name(RSInferenceRunner* runner, unsigned index, RSInferError* error)
-{
-    try
-    {
-        return duplicate_string(get_runner(runner)->get_input_tensor_name(index));
+        return nullptr;
     }
     catch (const std::exception& e)
     {
-        set_error(error, ERROR_CODE_INFERENCE_FAILED, std::string("Failed to get OpenVINO input tensor name: ") + e.what());
+        set_error(error, ERROR_CODE_INFERENCE_FAILED, std::string("Failed to get OpenVINO input tensors info: ") + e.what());
         return nullptr;
     }
 }
 
-const char* rs_inference_runner_get_output_tensor_name(RSInferenceRunner* runner, unsigned index, RSInferError* error)
+RSInferTensorArray* rs_inference_runner_get_output_tensors_info(RSInferenceRunner* runner, RSInferError* error)
 {
     try
     {
-        return duplicate_string(get_runner(runner)->get_output_tensor_name(index));
+        auto* backend = get_runner(runner);
+        const auto infos = backend->get_output_tensors_info();
+        if (!infos.has_value())
+        {
+            set_error(error, ERROR_CODE_INFERENCE_FAILED, "Failed to get OpenVINO output tensors info: " + infos.error());
+            return nullptr;
+        }
+        // Info tensors carry name, dtype and shape only; their data arrays are empty.
+        // Dynamic dimensions are reported as -1.
+        return make_output(infos.value(), error);
+    }
+    catch (const std::invalid_argument& e)
+    {
+        set_error(error, ERROR_CODE_INVALID_ARGUMENTS, e.what());
+        return nullptr;
     }
     catch (const std::exception& e)
     {
-        set_error(error, ERROR_CODE_INFERENCE_FAILED, std::string("Failed to get OpenVINO output tensor name: ") + e.what());
+        set_error(error, ERROR_CODE_INFERENCE_FAILED, std::string("Failed to get OpenVINO output tensors info: ") + e.what());
+        return nullptr;
+    }
+}
+
+char* rs_inference_runner_get_json_config(RSInferenceRunner* runner, RSInferError* error)
+{
+    try
+    {
+        auto* backend = get_runner(runner);
+        char* result = duplicate_string(config_to_json(backend->get_config()).dump());
+        if (!result)
+            set_error(error, ERROR_CODE_CREATION_FAILED, "Failed to allocate OpenVINO JSON config string");
+        return result; // freed by the caller with rs_infer_string_free
+    }
+    catch (const std::invalid_argument& e)
+    {
+        set_error(error, ERROR_CODE_INVALID_ARGUMENTS, e.what());
+        return nullptr;
+    }
+    catch (const std::exception& e)
+    {
+        set_error(error, ERROR_CODE_INFERENCE_FAILED, std::string("Failed to get OpenVINO JSON config: ") + e.what());
         return nullptr;
     }
 }
