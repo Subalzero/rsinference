@@ -22,6 +22,19 @@
   is now 0.93 ms (p50), down from 5.2 ms. This applies to every backend; no ABI
   change. The header now states that input arrays may be caller-allocated and
   are valid only until the call returns.
+- **TensorRT replays CUDA graphs.** Each execution context records its
+  copy-in, `enqueueV3` and copy-out as a CUDA graph and replays it with one
+  `cudaGraphLaunch` while the input shapes stay the same, replacing ~54 kernel
+  launches per request for the sample model. The first request with new shapes
+  runs directly (TensorRT may do deferred setup then) and the next one is
+  captured. An engine that cannot be captured logs a warning and keeps using
+  `enqueueV3`. The sync round trip is now 0.63 ms (p50), down from 0.93 ms, and
+  async throughput with 4 contexts is ~1,700 req/s.
+
+### New configuration
+
+- TensorRT `cuda_graph` (boolean, default `true`): set it to `false` to always
+  run `enqueueV3` directly. It is reported by `json_config`.
 
 ### Behavior changes (TensorRT)
 

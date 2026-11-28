@@ -853,6 +853,36 @@ mod tests {
     }
 
     hardware_test! {
+        // The first request with a shape runs directly and later ones replay a
+        // CUDA graph. Replays must read each new input, so a graph instance has
+        // to match an instance that never uses graphs, request for request.
+        fn tensorrt_cuda_graph_matches_direct_execution() {
+            let Some(engine) = tensorrt_engine() else { return };
+            let graph = engine.create_infer_instance(&sample_model(), None).unwrap();
+            let direct = engine.create_infer_instance(&sample_model(), Some(r#"{"cuda_graph": false}"#)).unwrap();
+            assert!(graph.json_config().unwrap().contains(r#""cuda_graph":true"#));
+            assert!(direct.json_config().unwrap().contains(r#""cuda_graph":false"#));
+
+            let mut last_scores: Option<Vec<u8>> = None;
+            for fill in [0.0f32, 0.5, -0.25, 1.0] {
+                let mut input = sample_input();
+                input.data = std::iter::repeat_n(fill.to_ne_bytes(), 3 * 480 * 640).flatten().collect();
+
+                graph.infer(&[input.clone()]).unwrap();
+                let from_graph = graph.get_results().unwrap();
+                direct.infer_async(&[input]).unwrap();
+                let from_direct = direct.get_results().unwrap();
+
+                assert_sample_outputs(&from_graph);
+                assert_eq!(from_graph, from_direct, "graph and direct outputs differ for fill {fill}");
+                let scores = from_graph.iter().find(|t| t.name == "scores").unwrap().data.clone();
+                assert_ne!(last_scores.as_ref(), Some(&scores), "outputs did not change with the input (fill {fill})");
+                last_scores = Some(scores);
+            }
+        }
+    }
+
+    hardware_test! {
         fn tensorrt_get_results_without_infer_fails() {
             let Some(engine) = tensorrt_engine() else { return };
             let instance = engine.create_infer_instance(&sample_model(), None).unwrap();

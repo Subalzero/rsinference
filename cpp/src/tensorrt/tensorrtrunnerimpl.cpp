@@ -313,6 +313,12 @@ static std::string load_config(const std::string& json_config, rsinfer::RunnerPa
         params.allowGpuFallback = j["allow_gpu_fallback"].get<bool>();
     }
 
+    if (j.contains("cuda_graph"))
+    {
+        if (!j["cuda_graph"].is_boolean()) return "cuda_graph must be a boolean";
+        params.cudaGraph = j["cuda_graph"].get<bool>();
+    }
+
     if (j.contains("workspace_size"))
     {
         if (!j["workspace_size"].is_number_unsigned() &&
@@ -496,6 +502,7 @@ static json config_to_json(const rsinfer::RunnerParams& params)
 
     if (!params.pluginsToSerialize.empty()) j["plugins_to_serialize"] = params.pluginsToSerialize;
     j["allow_gpu_fallback"] = params.allowGpuFallback;
+    j["cuda_graph"] = params.cudaGraph;
 
     // workspace_size is reported through memory_pool_limits.WORKSPACE.
     if (!params.memoryPoolLimits.empty())

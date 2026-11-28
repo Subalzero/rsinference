@@ -37,6 +37,10 @@ namespace rsinfer
         std::string onnxFileName;  //!< REQUIRED: Model file in ONNX format.
         uint32_t nContexts{ 1 };  //!< Number of contexts tensorrt will generate
         bool dynamic{ false };
+        //! Record each context's copy-in, execution and copy-out as a CUDA graph
+        //! and replay it while the input shapes stay the same. A context whose
+        //! engine cannot be captured falls back to plain enqueueV3.
+        bool cudaGraph{ true };
 
         // TensorRT builder configuration. Empty optionals preserve TensorRT defaults.
         std::vector<nvinfer1::BuilderFlag> builderFlags;
@@ -159,6 +163,16 @@ namespace rsinfer
             std::unique_ptr<nvinfer1::IExecutionContext> context;
             cudaStream_t stream{ nullptr };
             std::vector<IOBuffer> buffers;
+
+            //! Replayable copy-in + enqueueV3 + copy-out for `graph_key`.
+            cudaGraphExec_t graph{ nullptr };
+            //! Input shapes the graph (or the last direct run) was made for.
+            std::vector<int64_t> graph_key;
+            //! The last request ran directly with `graph_key`, so TensorRT has done
+            //! its deferred work for these shapes and the next one may be captured.
+            bool ran_direct{ false };
+            //! Capture failed once; this context always runs directly.
+            bool graph_unsupported{ false };
         };
 
         std::vector<IOTensor> _io;
@@ -189,6 +203,12 @@ namespace rsinfer
         //! slot's stream. Returns the slot, still owned by the caller.
         Slot* enqueue(std::span<const TensorView> input_tensors);
         void ensure_capacity(IOBuffer& buffer, size_t bytes);
+        //! Queues copy-in, enqueueV3 and copy-out on the slot's stream.
+        void record_work(Slot& slot);
+        //! Runs the queued request through the slot's graph when possible.
+        void launch(Slot& slot, std::vector<int64_t>&& key, bool buffers_moved);
+        bool capture_graph(Slot& slot);
+        static void destroy_graph(Slot& slot) noexcept;
         std::vector<Tensor> collect_outputs(const Slot& slot) const;
         void push_completion(Completion completion);
         void finish_request();

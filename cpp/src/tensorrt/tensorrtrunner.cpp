@@ -399,6 +399,7 @@ namespace rsinfer
 		{
 			if (slot->stream)
 				cudaStreamSynchronize(slot->stream);
+			destroy_graph(*slot);
 			for (auto& buffer : slot->buffers)
 			{
 				if (buffer.device) cudaFree(buffer.device);
@@ -514,6 +515,7 @@ namespace rsinfer
 			throw std::runtime_error("Not all input dimensions were specified");
 
 		// Size every buffer from the resolved shapes and bind it.
+		bool buffers_moved = false;
 		for (size_t i = 0; i < _io.size(); ++i)
 		{
 			IOBuffer& buffer = slot->buffers[i];
@@ -524,12 +526,15 @@ namespace rsinfer
 					throw std::runtime_error("Unresolved dynamic dimension in tensor: " + _io[i].name);
 			}
 			buffer.bytes = samplesCommon::getNbBytes(_io[i].type, volume(buffer.shape));
+			const void* previous = buffer.device;
 			ensure_capacity(buffer, buffer.bytes);
+			buffers_moved = buffers_moved || buffer.device != previous;
 			if (!context->setTensorAddress(_io[i].name.c_str(), buffer.device))
 				throw std::runtime_error("setTensorAddress failed for tensor: " + _io[i].name);
 		}
 
-		// Copy in: caller memory -> pinned -> device, all on the slot's stream.
+		// Copy in, step 1: caller memory -> pinned. The device copies are queued
+		// by record_work (directly or inside the slot's CUDA graph).
 		for (size_t v = 0; v < input_tensors.size(); ++v)
 		{
 			IOBuffer& buffer = slot->buffers[view_io[v]];
@@ -541,22 +546,123 @@ namespace rsinfer
 			}
 			if (!data.empty())
 				std::memcpy(buffer.host, data.data(), data.size());
-			check_cuda(cudaMemcpyAsync(buffer.device, buffer.host, buffer.bytes, cudaMemcpyHostToDevice, slot->stream),
+		}
+
+		// The graph is only valid for the shapes it was recorded with.
+		std::vector<int64_t> key;
+		for (size_t i : _input_order)
+		{
+			const nvinfer1::Dims& shape = slot->buffers[i].shape;
+			key.push_back(shape.nbDims);
+			key.insert(key.end(), shape.d, shape.d + shape.nbDims);
+		}
+		launch(*slot, std::move(key), buffers_moved);
+
+		guard.slot = nullptr; // queued successfully; the caller owns the slot now
+		return slot;
+	}
+
+	void TensorRTRunner::record_work(Slot& slot)
+	{
+		for (size_t i : _input_order)
+		{
+			IOBuffer& buffer = slot.buffers[i];
+			check_cuda(cudaMemcpyAsync(buffer.device, buffer.host, buffer.bytes, cudaMemcpyHostToDevice, slot.stream),
 				"cudaMemcpyAsync (host to device)");
 		}
 
-		if (!context->enqueueV3(slot->stream))
+		if (!slot.context->enqueueV3(slot.stream))
 			throw std::runtime_error("enqueueV3 failed");
 
 		for (size_t i : _output_order)
 		{
-			IOBuffer& buffer = slot->buffers[i];
-			check_cuda(cudaMemcpyAsync(buffer.host, buffer.device, buffer.bytes, cudaMemcpyDeviceToHost, slot->stream),
+			IOBuffer& buffer = slot.buffers[i];
+			check_cuda(cudaMemcpyAsync(buffer.host, buffer.device, buffer.bytes, cudaMemcpyDeviceToHost, slot.stream),
 				"cudaMemcpyAsync (device to host)");
 		}
+	}
 
-		guard.slot = nullptr; // queued successfully; the caller owns the slot now
-		return slot;
+	void TensorRTRunner::launch(Slot& slot, std::vector<int64_t>&& key, bool buffers_moved)
+	{
+		const bool same_shapes = key == slot.graph_key;
+		if (!same_shapes || buffers_moved)
+		{
+			// New shapes or new buffers: the recorded graph no longer applies.
+			destroy_graph(slot);
+			slot.ran_direct = false;
+			slot.graph_key = std::move(key);
+		}
+
+		if (slot.graph)
+		{
+			check_cuda(cudaGraphLaunch(slot.graph, slot.stream), "cudaGraphLaunch");
+			return;
+		}
+
+		// TensorRT may do deferred setup in the first enqueueV3 after a shape
+		// change, so a shape is captured only once it has run directly.
+		if (_params.cudaGraph && !slot.graph_unsupported && slot.ran_direct)
+		{
+			if (capture_graph(slot))
+			{
+				check_cuda(cudaGraphLaunch(slot.graph, slot.stream), "cudaGraphLaunch");
+				return;
+			}
+			slot.graph_unsupported = true;
+			sample::gLogWarning << "CUDA graph capture is not supported for this engine; using enqueueV3 directly" << std::endl;
+		}
+
+		record_work(slot);
+		slot.ran_direct = true;
+	}
+
+	bool TensorRTRunner::capture_graph(Slot& slot)
+	{
+		// Thread-local mode: other threads may allocate (other slots growing
+		// their buffers) while this stream is being captured.
+		if (cudaStreamBeginCapture(slot.stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess)
+		{
+			cudaGetLastError();
+			return false;
+		}
+
+		bool recorded = true;
+		try
+		{
+			record_work(slot);
+		}
+		catch (const std::exception& e)
+		{
+			sample::gLogWarning << "CUDA graph capture failed: " << e.what() << std::endl;
+			recorded = false;
+		}
+
+		// Always end the capture, or the stream stays unusable.
+		cudaGraph_t graph = nullptr;
+		const cudaError_t end_status = cudaStreamEndCapture(slot.stream, &graph);
+		cudaGraphExec_t exec = nullptr;
+		const bool ok = recorded && end_status == cudaSuccess && graph
+			&& cudaGraphInstantiate(&exec, graph, 0) == cudaSuccess;
+		if (graph)
+			cudaGraphDestroy(graph);
+		if (!ok)
+		{
+			if (exec)
+				cudaGraphExecDestroy(exec);
+			cudaGetLastError(); // capture errors are not sticky; clear them
+			return false;
+		}
+		slot.graph = exec;
+		return true;
+	}
+
+	void TensorRTRunner::destroy_graph(Slot& slot) noexcept
+	{
+		if (slot.graph)
+		{
+			cudaGraphExecDestroy(slot.graph);
+			slot.graph = nullptr;
+		}
 	}
 
 	std::vector<Tensor> TensorRTRunner::collect_outputs(const Slot& slot) const
