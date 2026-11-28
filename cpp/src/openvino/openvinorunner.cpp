@@ -86,6 +86,17 @@ namespace rsinfer
             return result;
         }
 
+        std::vector<int64_t> to_info_shape(const ov::PartialShape& shape)
+        {
+            if (shape.rank().is_dynamic())
+                return {};
+            std::vector<int64_t> result;
+            result.reserve(shape.size());
+            for (const auto& dim : shape)
+                result.push_back(dim.is_static() ? dim.get_length() : -1);
+            return result;
+        }
+
         OpenVINORunnerParams make_params(const std::string& model_xml, const std::string& device)
         {
             OpenVINORunnerParams params;
@@ -269,6 +280,55 @@ namespace rsinfer
         const size_t size = data_type_element_size(data_type);
         if (size == 0) throw std::invalid_argument("Unsupported OpenVINO tensor data type");
         return size;
+    }
+
+    std::expected<std::vector<rsinfer::Tensor>, std::string> OpenVINORunner::get_input_tensors_info() const
+    {
+        try
+        {
+            std::vector<rsinfer::Tensor> inputs;
+            inputs.reserve(_compiled_model.inputs().size());
+            for (const auto& port : _compiled_model.inputs())
+            {
+                rsinfer::Tensor input;
+                input.name = port.get_any_name();
+                input.dtype = from_ov_element_type(port.get_element_type());
+                input.shape = to_info_shape(port.get_partial_shape());
+                inputs.push_back(std::move(input));
+            }
+            return inputs;
+        }
+        catch (const std::exception& e)
+        {
+            return std::unexpected(e.what());
+        }
+    }
+
+    std::expected<std::vector<rsinfer::Tensor>, std::string> OpenVINORunner::get_output_tensors_info() const
+    {
+        try
+        {
+            std::vector<rsinfer::Tensor> outputs;
+            outputs.reserve(_compiled_model.outputs().size());
+            for (const auto& port : _compiled_model.outputs())
+            {
+                rsinfer::Tensor output;
+                output.name = port.get_any_name();
+                output.dtype = from_ov_element_type(port.get_element_type());
+                output.shape = to_info_shape(port.get_partial_shape());
+                outputs.push_back(std::move(output));
+            }
+            return outputs;
+        }
+        catch (const std::exception& e)
+        {
+            return std::unexpected(e.what());
+        }
+    }
+
+    OpenVINORunnerParams OpenVINORunner::get_config() const
+    {
+        return _params;
     }
 
     void OpenVINORunner::begin_request()

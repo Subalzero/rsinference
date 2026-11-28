@@ -14,6 +14,7 @@
 #include <optional>
 #include <utility>
 #include <variant>
+#include <expected>
 
 namespace rsinfer
 {
@@ -57,6 +58,14 @@ namespace rsinfer
 
         // Optional engine cache path overrides the default model-derived filename.
         std::string engineFile;
+
+        //! Optimization profile shapes per input tensor, as given in the "profile" config.
+        //! Kept so the effective configuration can be reported back.
+        struct ProfileDims
+        {
+            nvinfer1::Dims min, opt, max;
+        };
+        std::map<std::string, ProfileDims> profile;
     };
 
     class TensorRTRunner
@@ -89,6 +98,11 @@ namespace rsinfer
         std::string get_output_tensor_name(uint32_t index) const;
         size_t get_number_of_inputs() const;
         size_t get_number_of_outputs() const;
+
+        std::expected<std::vector<Tensor>, std::string> get_input_tensors_info() const;
+        std::expected<std::vector<Tensor>, std::string> get_output_tensors_info() const;
+
+        RunnerParams get_config() const;
 
         static nvinfer1::Dims vector_to_dims(const std::vector<int>& vec);
 

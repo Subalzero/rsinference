@@ -3,6 +3,7 @@
 #include "tensorrtrunner.h"
 
 #include <cassert>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -36,16 +37,51 @@ namespace rsinfer
 			}
 		}
 
-		//! "<model>.engine" for static builds, "<model>.dynamic.engine" for dynamic ones.
-		//! Splits at the last '.', not the first, so "./models/foo.onnx" works.
-		std::string engine_path_for(const std::string& onnx_file, bool dynamic)
+		//! Stable 64-bit FNV-1a hash of the optimization profile, so each set of
+		//! min/opt/max ranges gets its own cache file. std::hash is not used
+		//! because its value is not guaranteed to be stable between builds.
+		uint64_t profile_hash(const std::map<std::string, RunnerParams::ProfileDims>& profile)
 		{
+			uint64_t h = 14695981039346656037ull;
+			auto mix = [&h](const void* bytes, size_t n)
+			{
+				const auto* p = static_cast<const unsigned char*>(bytes);
+				for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+			};
+			for (const auto& [name, dims] : profile)
+			{
+				mix(name.data(), name.size() + 1); // include the NUL as a separator
+				for (const nvinfer1::Dims* d : { &dims.min, &dims.opt, &dims.max })
+				{
+					const int64_t rank = d->nbDims;
+					mix(&rank, sizeof(rank));
+					for (int32_t i = 0; i < d->nbDims; ++i)
+					{
+						const int64_t v = d->d[i];
+						mix(&v, sizeof(v));
+					}
+				}
+			}
+			return h;
+		}
+
+		//! "<model>.engine" for static builds, "<model>.dynamic-<profile hash>.engine"
+		//! for dynamic ones, so changing the profile never reuses an engine built
+		//! for other shape ranges. Splits at the last '.', not the first, so
+		//! "./models/foo.onnx" works.
+		std::string engine_path_for(const RunnerParams& params)
+		{
+			const std::string& onnx_file = params.onnxFileName;
 			const auto slash = onnx_file.find_last_of("/\\");
 			const auto dot = onnx_file.rfind('.');
 			const std::string base = (dot == std::string::npos || (slash != std::string::npos && dot < slash))
 				? onnx_file
 				: onnx_file.substr(0, dot);
-			return base + (dynamic ? ".dynamic.engine" : ".engine");
+			if (!params.dynamic)
+				return base + ".engine";
+			char hash[17];
+			std::snprintf(hash, sizeof(hash), "%016llx", static_cast<unsigned long long>(profile_hash(params.profile)));
+			return base + ".dynamic-" + hash + ".engine";
 		}
 
 		// The engine cache has no metadata sidecar, so it cannot prove that a
@@ -725,7 +761,7 @@ namespace rsinfer
 
 	bool TensorRTRunner::load_engine(std::vector<char>& data) {
 		std::string engineFilePath = _params.engineFile.empty()
-			? engine_path_for(_params.onnxFileName, _params.dynamic)
+			? engine_path_for(_params)
 			: _params.engineFile;
 		std::ifstream file(engineFilePath, std::ios::binary);
 		if (!file) {
@@ -749,7 +785,7 @@ namespace rsinfer
 	bool TensorRTRunner::save_engine_to_plan_file(nvinfer1::IHostMemory* plan)
 	{
 		std::string planFilePath = _params.engineFile.empty()
-			? engine_path_for(_params.onnxFileName, _params.dynamic)
+			? engine_path_for(_params)
 			: _params.engineFile;
 		std::ofstream planFile(planFilePath, std::ios::binary);
 		planFile.write(reinterpret_cast<const char*>(plan->data()), plan->size());
@@ -780,4 +816,68 @@ namespace rsinfer
 		}
 		return vec;
 	}
+
+	std::expected<std::vector<Tensor>, std::string> TensorRTRunner::get_input_tensors_info() const
+	{
+		try
+		{
+			// get_input_tensor_name() reads input_tensor_names when it is set,
+			// so iterate that list rather than the engine's input count.
+			const size_t n_inputs = _params.inputTensorNames.empty()
+				? get_number_of_inputs() : _params.inputTensorNames.size();
+			std::vector<Tensor> tensors;
+			tensors.reserve(n_inputs);
+
+			for (uint32_t i = 0; i < n_inputs; ++i)
+			{
+				Tensor t;
+				t.name = get_input_tensor_name(i);
+				auto dims = get_input_shape(i);
+				t.shape.assign(dims.begin(), dims.end());
+				t.dtype = to_inferrs_data_type(get_tensor_data_type(t.name));
+				tensors.push_back(std::move(t));
+			}
+
+			return tensors;
+		}
+		catch(const std::exception& e)
+		{
+			return std::unexpected(e.what());
+		}
+	}
+
+	std::expected<std::vector<Tensor>, std::string> TensorRTRunner::get_output_tensors_info() const
+	{
+		try
+		{
+			// get_output_tensor_name() reads output_tensor_names when it is set,
+			// so iterate that list rather than the engine's output count.
+			const size_t n_outputs = _params.outputTensorNames.empty()
+				? get_number_of_outputs() : _params.outputTensorNames.size();
+			std::vector<Tensor> tensors;
+			tensors.reserve(n_outputs);
+
+			for (uint32_t i = 0; i < n_outputs; ++i)
+			{
+				Tensor t;
+				t.name = get_output_tensor_name(i);
+				auto dims = get_output_shape(i);
+				t.shape.assign(dims.begin(), dims.end());
+				t.dtype = to_inferrs_data_type(get_tensor_data_type(t.name));
+				tensors.push_back(std::move(t));
+			}
+
+			return tensors;
+		}
+		catch(const std::exception& e)
+		{
+			return std::unexpected(e.what());
+		}
+	}
+
+	RunnerParams TensorRTRunner::get_config() const
+	{
+		return _params;
+	}
+	
 } // namespace inferrs

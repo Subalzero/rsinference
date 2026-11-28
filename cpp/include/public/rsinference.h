@@ -20,8 +20,12 @@ extern "C" {
 #endif
 
 // Increment when a change alters public struct layout or function contracts.
-#define RSINFERENCE_ABI_VERSION 2u
+#define RSINFERENCE_ABI_VERSION 3u
 BACKEND_EXPORT unsigned int rs_inference_abi_version(void);
+
+// Array helpers below: a zero-length array is valid and has data == NULL (and
+// RSInferTensorArray::tensors == NULL), so never treat a NULL data pointer as an
+// error when length is 0. A NULL return from a *_create helper means allocation failed.
 
 typedef struct RSInferLLArray {
     long long* data;
@@ -68,8 +72,8 @@ typedef struct RSInferError {
 // through this helper, then reset the fields before reusing the structure.
 BACKEND_EXPORT void rs_infer_error_cleanmsg(RSInferError* error);
 
-// Frees a string returned by the bridge (for example a tensor name from
-// rs_inference_runner_get_input_tensor_name). Strings must be released with
+// Frees a string returned by the bridge (for example the JSON from
+// rs_inference_runner_get_json_config). Strings must be released with
 // this function, not with the host's free(), because the bridge may use a
 // different C runtime.
 BACKEND_EXPORT void rs_infer_string_free(const char* string);
@@ -216,109 +220,50 @@ BACKEND_EXPORT int rs_inference_runner_infer_async(RSInferenceRunner* runner, RS
  */
 BACKEND_EXPORT RSInferTensorArray* rs_inference_runner_get_results(RSInferenceRunner* runner, RSInferError* error);
 /**
- * Retrieves the input shape of a specific tensor from the provided RSInferenceRunner instance.
- * @param runner: Pointer to the RSInferenceRunner instance from which to retrieve the input shape.
- * @param index: The index of the input tensor for which to retrieve the shape.
- * @param error: Pointer to an RSInferError structure to capture any errors during shape retrieval
- * @return Pointer to an RSInferIntArray containing the input shape, or nullptr if retrieval fails.
- * 
- * @attention THIS FUNCTION MUST BE THREAD-SAFE: It may be called from multiple threads concurrently, so ensure that your implementation is safe for concurrent execution.
- * 
- * @attention Implementation Note: This function is called by the Rust engine to retrieve the input shape of a specific tensor.
- * In creating your own inference runner, you should implement this function to return the shape of the specified input tensor.
- * The returned RSInferIntArray should be allocated and populated with the input shape.
- * The Rust side will handle the memory management of the returned RSInferIntArray, so you should not free it.
- * If you encounter an error while retrieving the input shape, you can populate the RSInferError structure pointed to by the error parameter,
- * but do not free it. The Rust side will handle the memory management of the error structure.
- */
-BACKEND_EXPORT RSInferIntArray* rs_inference_runner_get_input_shape(RSInferenceRunner* runner, unsigned index, RSInferError* error);
-/**
- * Retrieves the output shape of a specific tensor from the provided RSInferenceRunner instance.
- * @param runner: Pointer to the RSInferenceRunner instance from which to retrieve the output shape.
- * @param index: The index of the output tensor for which to retrieve the shape.
- * @param error: Pointer to an RSInferError structure to capture any errors during shape retrieval.
- * @return Pointer to an RSInferIntArray containing the output shape, or nullptr if retrieval fails.
- * 
+ * Retrieves the input tensor information from the provided RSInferenceRunner instance.
+ * @param runner: Pointer to the RSInferenceRunner instance from which to retrieve input tensor information
+ * @param error: Pointer to an RSInferError structure to capture any errors during retrieval
+ * @return Pointer to an RSInferTensorArray containing the input tensor information, or nullptr if retrieval fails.
+ *
  * @attention THIS FUNCTION MUST BE THREAD-SAFE: It may be called from multiple threads concurrently, so ensure that your implementation is safe for concurrent execution.
  *
- * @attention Implementation Note: This function is called by the Rust engine to retrieve the output shape of a specific tensor.
- * In creating your own inference runner, you should implement this function to return the shape of the specified output tensor.
- * The returned RSInferIntArray should be allocated and populated with the output shape.
- * The Rust side will handle the memory management of the returned RSInferIntArray, so you should not free it.
- * If you encounter an error while retrieving the output shape, you can populate the RSInferError structure pointed to by the error parameter,
+ * @attention Implementation Note: This function is called by the Rust engine to describe every model input, in model order.
+ * Return one RSInferTensor per input with its name, data type and shape. Use -1 for a dynamic dimension, and an empty
+ * shape when even the rank is unknown. Leave each tensor's data array empty (length 0); it carries no tensor data.
+ * The returned RSInferTensorArray must be freshly allocated with the rs_infer_* helpers; the caller takes ownership and
+ * frees it with rs_infer_tensorarray_destroy, so do not free or reuse it.
+ * If you encounter an error, return nullptr and populate the RSInferError structure pointed to by the error parameter,
  * but do not free it. The Rust side will handle the memory management of the error structure.
  */
-BACKEND_EXPORT RSInferIntArray* rs_inference_runner_get_output_shape(RSInferenceRunner* runner, unsigned index, RSInferError* error);
+BACKEND_EXPORT RSInferTensorArray* rs_inference_runner_get_input_tensors_info(RSInferenceRunner* runner, RSInferError* error);
 /**
- * Retrieves the data type of a specific tensor from the provided RSInferenceRunner instance.
- * @param runner: Pointer to the RSInferenceRunner instance from which to retrieve the tensor data type.
- * @param tensor_name: The name of the tensor for which to retrieve the data type.
- * @param error: Pointer to an RSInferError structure to capture any errors during data type retrieval.
- * @return The RSInferDataType of the specified tensor, or RSInferDataType_Unknown if retrieval fails.
- * 
+ * Retrieves the output tensor information from the provided RSInferenceRunner instance.
+ * @param runner: Pointer to the RSInferenceRunner instance from which to retrieve output tensor information
+ * @param error: Pointer to an RSInferError structure to capture any errors during retrieval
+ * @return Pointer to an RSInferTensorArray containing the output tensor information, or nullptr if retrieval fails.
+ *
  * @attention THIS FUNCTION MUST BE THREAD-SAFE: It may be called from multiple threads concurrently, so ensure that your implementation is safe for concurrent execution.
  *
- * @attention Implementation Note: This function is called by the Rust engine to retrieve the data type of a specific tensor.
- * In creating your own inference runner, you should implement this function to return the data type of the specified tensor.
- * If you encounter an error while retrieving the tensor data type, you can populate the RSInferError structure pointed to by the error parameter,
- * but do not free it. The Rust side will handle the memory management of the error structure.
+ * @attention Implementation Note: Same contract as rs_inference_runner_get_input_tensors_info, for the model outputs:
+ * one RSInferTensor per output with name, data type and shape (-1 for dynamic dimensions, empty for an unknown rank),
+ * an empty data array, and a freshly allocated array that the caller frees with rs_infer_tensorarray_destroy.
  */
-BACKEND_EXPORT RSInferDataType rs_inference_runner_get_tensor_data_type(RSInferenceRunner* runner, const char* tensor_name, RSInferError* error);
+BACKEND_EXPORT RSInferTensorArray* rs_inference_runner_get_output_tensors_info(RSInferenceRunner* runner, RSInferError* error);
 /**
- * Retrieves the size in bytes of a specific data type from the provided RSInferenceRunner instance.
- * @param runner: Pointer to the RSInferenceRunner instance from which to retrieve the data size.
- * @param data_type: The RSInferDataType for which to retrieve the size in bytes.
- * @param error: Pointer to an RSInferError structure to capture any errors during data size retrieval.
- * @return The size in bytes of one element of the specified data type, or 0 if retrieval fails.
- * Packed 4-bit types (Int4, FP4) report 1, their one-byte storage unit; a buffer of n such
- * elements is (n + 1) / 2 bytes, not n * 1.
- * 
+ * Retrieves the JSON configuration string from the provided RSInferenceRunner instance.
+ * @param runner: Pointer to the RSInferenceRunner instance from which to retrieve the JSON configuration string
+ * @param error: Pointer to an RSInferError structure to capture any errors during retrieval
+ * @return Pointer to a dynamically allocated string containing the JSON configuration, or nullptr if retrieval fails.
+ *
  * @attention THIS FUNCTION MUST BE THREAD-SAFE: It may be called from multiple threads concurrently, so ensure that your implementation is safe for concurrent execution.
  *
- * @attention Implementation Note: This function is called by the Rust engine to retrieve the size in bytes of a specific data type.
- * In creating your own inference runner, you should implement this function to return the size in bytes of the specified data type.
- * If you encounter an error while retrieving the data size, you can populate the RSInferError structure pointed to by the error parameter,
+ * @attention Implementation Note: This function is called by the Rust engine to retrieve the JSON configuration string.
+ * In creating your own inference runner, you should implement this function to return the JSON configuration string associated with the runner.
+ * The returned string should be dynamically allocated and must be freed by the caller using rs_infer_string_free.
+ * If you encounter an error while retrieving the JSON configuration, you can populate the RSInferError structure pointed to by the error parameter, 
  * but do not free it. The Rust side will handle the memory management of the error structure.
  */
-BACKEND_EXPORT size_t rs_inference_runner_get_tensor_data_size(RSInferenceRunner* runner, RSInferDataType data_type, RSInferError* error);
-/**
- * Retrieves the name of a specific input tensor from the provided RSInferenceRunner instance.
- * @param runner: Pointer to the RSInferenceRunner instance from which to retrieve the input tensor name.
- * @param index: The index of the input tensor for which to retrieve the name.
- * @return Pointer to a null-terminated string containing the input tensor name, or nullptr if retrieval fails.
- * 
- * @attention THIS FUNCTION MUST BE THREAD-SAFE: It may be called from multiple threads concurrently, so ensure that your implementation is safe for concurrent execution.
- *
- * @attention Implementation Note: This function is called by the Rust engine to retrieve the name of a specific input tensor.
- * In creating your own inference runner, you should implement this function to return the name of the specified input tensor.
- * The returned string should be a null-terminated C-style string. The Rust side will handle the memory management of the 
- * returned string, so you should not free it.
- * If you encounter an error while retrieving the input tensor name, you can populate the RSInferError structure pointed 
- * to by the error parameter,
- * but do not free it. The Rust side will handle the memory management of the error structure.
- */
-BACKEND_EXPORT const char* rs_inference_runner_get_input_tensor_name(RSInferenceRunner* runner, unsigned index, RSInferError* error);
-/**
- * Retrieves the name of a specific output tensor from the provided RSInferenceRunner instance.
- * @param runner: Pointer to the RSInferenceRunner instance from which to retrieve the output tensor name.
- * @param index: The index of the output tensor for which to retrieve the name.
- * @param error: Pointer to an RSInferError structure to capture any errors during name retrieval.
- * @return Pointer to a null-terminated string containing the output tensor name, or nullptr if retrieval fails.
- * 
- * @attention THIS FUNCTION MUST BE THREAD-SAFE: It may be called from multiple threads concurrently, so ensure that your implementation is safe for concurrent execution.
- *
- * @attention Implementation Note: This function is called by the Rust engine to retrieve the name of a specific output tensor.
- * In creating your own inference runner, you should implement this function to return the name of the specified output tensor.
- * The returned string should be a null-terminated C-style string. The Rust side will handle the memory management of the
- * returned string, so you should not free it.
- * If you encounter an error while retrieving the output tensor name, you can populate the RSInferError structure pointed to 
- * by the error parameter,
- * but do not free it. The Rust side will handle the memory management of the error structure.
- */
-BACKEND_EXPORT const char* rs_inference_runner_get_output_tensor_name(RSInferenceRunner* runner, unsigned index, RSInferError* error);
-
-
-
+BACKEND_EXPORT char* rs_inference_runner_get_json_config(RSInferenceRunner* runner, RSInferError* error);
 
 #ifdef __cplusplus
 }

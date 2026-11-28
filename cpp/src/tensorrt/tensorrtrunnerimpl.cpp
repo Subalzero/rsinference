@@ -7,6 +7,7 @@
 #include <limits>
 #include <map>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -22,46 +23,6 @@ enum ErrorCodes
 };
 
 using json = nlohmann::json;
-
-static RSInferDataType tensorrt_data_type_to_public(nvinfer1::DataType dtype)
-{
-    switch (dtype)
-    {
-    case nvinfer1::DataType::kFLOAT: return RSInferDataType_Float32;
-    case nvinfer1::DataType::kHALF:  return RSInferDataType_Half;
-    case nvinfer1::DataType::kINT32: return RSInferDataType_Int32;
-    case nvinfer1::DataType::kBOOL:  return RSInferDataType_Bool;
-    case nvinfer1::DataType::kUINT8: return RSInferDataType_UInt8;
-    case nvinfer1::DataType::kFP8:   return RSInferDataType_FP8;
-    case nvinfer1::DataType::kE8M0:  return RSInferDataType_E8M0;
-    case nvinfer1::DataType::kBF16:  return RSInferDataType_BF16;
-    case nvinfer1::DataType::kINT64: return RSInferDataType_Int64;
-    case nvinfer1::DataType::kINT4:  return RSInferDataType_Int4;
-    case nvinfer1::DataType::kFP4:   return RSInferDataType_FP4;
-    case nvinfer1::DataType::kINT8:  return RSInferDataType_Int8;
-    default:                         return RSInferDataType_Unknown;
-    }
-}
-
-static bool public_data_type_to_tensorrt(RSInferDataType dtype, nvinfer1::DataType& result)
-{
-    switch (dtype)
-    {
-    case RSInferDataType_Float32: result = nvinfer1::DataType::kFLOAT; return true;
-    case RSInferDataType_Int32:   result = nvinfer1::DataType::kINT32; return true;
-    case RSInferDataType_Int64:   result = nvinfer1::DataType::kINT64; return true;
-    case RSInferDataType_UInt8:   result = nvinfer1::DataType::kUINT8; return true;
-    case RSInferDataType_Int8:    result = nvinfer1::DataType::kINT8; return true;
-    case RSInferDataType_Bool:    result = nvinfer1::DataType::kBOOL; return true;
-    case RSInferDataType_Half:    result = nvinfer1::DataType::kHALF; return true;
-    case RSInferDataType_FP8:     result = nvinfer1::DataType::kFP8; return true;
-    case RSInferDataType_E8M0:    result = nvinfer1::DataType::kE8M0; return true;
-    case RSInferDataType_BF16:    result = nvinfer1::DataType::kBF16; return true;
-    case RSInferDataType_Int4:    result = nvinfer1::DataType::kINT4; return true;
-    case RSInferDataType_FP4:     result = nvinfer1::DataType::kFP4; return true;
-    default:                      return false;
-    }
-}
 
 struct ProfileEntry
 {
@@ -81,7 +42,7 @@ static bool to_dims(const json& j, nvinfer1::Dims& d)
     return true;
 }
 
-static bool parse_builder_flag(const std::string& name, nvinfer1::BuilderFlag& flag)
+static const std::map<std::string, nvinfer1::BuilderFlag>& builder_flag_names()
 {
     static const std::map<std::string, nvinfer1::BuilderFlag> flags{
         {"DEBUG", nvinfer1::BuilderFlag::kDEBUG},
@@ -103,6 +64,12 @@ static bool parse_builder_flag(const std::string& name, nvinfer1::BuilderFlag& f
         {"EDITABLE_TIMING_CACHE", nvinfer1::BuilderFlag::kEDITABLE_TIMING_CACHE},
         {"DISTRIBUTIVE_INDEPENDENCE", nvinfer1::BuilderFlag::kDISTRIBUTIVE_INDEPENDENCE}
     };
+    return flags;
+}
+
+static bool parse_builder_flag(const std::string& name, nvinfer1::BuilderFlag& flag)
+{
+    const auto& flags = builder_flag_names();
     const std::string key = name.size() > 1 && name[0] == 'k' ? name.substr(1) : name;
     auto it = flags.find(key);
     if (it == flags.end()) return false;
@@ -110,7 +77,7 @@ static bool parse_builder_flag(const std::string& name, nvinfer1::BuilderFlag& f
     return true;
 }
 
-static bool parse_memory_pool(const std::string& name, nvinfer1::MemoryPoolType& pool)
+static const std::map<std::string, nvinfer1::MemoryPoolType>& memory_pool_names()
 {
     static const std::map<std::string, nvinfer1::MemoryPoolType> pools{
         {"WORKSPACE", nvinfer1::MemoryPoolType::kWORKSPACE},
@@ -120,6 +87,12 @@ static bool parse_memory_pool(const std::string& name, nvinfer1::MemoryPoolType&
         {"TACTIC_DRAM", nvinfer1::MemoryPoolType::kTACTIC_DRAM},
         {"TACTIC_SHARED_MEMORY", nvinfer1::MemoryPoolType::kTACTIC_SHARED_MEMORY}
     };
+    return pools;
+}
+
+static bool parse_memory_pool(const std::string& name, nvinfer1::MemoryPoolType& pool)
+{
+    const auto& pools = memory_pool_names();
     auto it = pools.find(name);
     if (it == pools.end()) return false;
     pool = it->second;
@@ -393,12 +366,214 @@ static std::string load_config(const std::string& json_config, rsinfer::RunnerPa
             if (!v.is_object() || !v.contains("min") || !v.contains("opt") || !v.contains("max") ||
                 !to_dims(v["min"], e.mn) || !to_dims(v["opt"], e.opt) || !to_dims(v["max"], e.mx))
                 return "Bad profile entry for tensor: " + e.name;
+            params.profile[e.name] = { e.mn, e.opt, e.mx };
             entries.push_back(std::move(e));
         }
     }
 
     params.dynamic = !entries.empty();
     return {};
+}
+
+template <typename Map, typename Value>
+static const std::string* name_of(const Map& names, Value value)
+{
+    for (const auto& [name, v] : names)
+        if (v == value) return &name;
+    return nullptr;
+}
+
+static json dims_to_json(const nvinfer1::Dims& d)
+{
+    json arr = json::array();
+    for (int32_t i = 0; i < d.nbDims; ++i) arr.push_back(d.d[i]);
+    return arr;
+}
+
+//! Inverse of load_config: emits the same keys so the result can be fed back to
+//! rs_inference_runner_create. Unset optional settings are omitted.
+static json config_to_json(const rsinfer::RunnerParams& params)
+{
+    json j = json::object();
+    j["n_contexts"] = params.nContexts;
+    if (!params.timingCacheFile.empty()) j["timing_cache"] = params.timingCacheFile;
+    j["dla_core"] = params.dlaCore;
+    j["int8"] = params.int8;
+    j["fp16"] = params.fp16;
+    j["bf16"] = params.bf16;
+    if (!params.inputTensorNames.empty()) j["input_tensor_names"] = params.inputTensorNames;
+    if (!params.outputTensorNames.empty()) j["output_tensor_names"] = params.outputTensorNames;
+
+    if (!params.builderFlags.empty())
+    {
+        json flags = json::array();
+        for (auto flag : params.builderFlags)
+            if (const auto* name = name_of(builder_flag_names(), flag)) flags.push_back(*name);
+        j["builder_flags"] = std::move(flags);
+    }
+
+    if (params.builderOptimizationLevel) j["builder_optimization_level"] = *params.builderOptimizationLevel;
+    if (params.avgTimingIterations) j["avg_timing_iterations"] = *params.avgTimingIterations;
+    if (params.maxAuxStreams) j["max_aux_streams"] = *params.maxAuxStreams;
+    if (params.maxThreads) j["max_threads"] = *params.maxThreads;
+    if (params.tacticSources) j["tactic_sources"] = *params.tacticSources;
+
+    if (params.profilingVerbosity)
+    {
+        switch (*params.profilingVerbosity)
+        {
+        case nvinfer1::ProfilingVerbosity::kLAYER_NAMES_ONLY: j["profiling_verbosity"] = "LAYER_NAMES_ONLY"; break;
+        case nvinfer1::ProfilingVerbosity::kNONE: j["profiling_verbosity"] = "NONE"; break;
+        case nvinfer1::ProfilingVerbosity::kDETAILED: j["profiling_verbosity"] = "DETAILED"; break;
+        default: break;
+        }
+    }
+    if (params.engineCapability)
+    {
+        switch (*params.engineCapability)
+        {
+        case nvinfer1::EngineCapability::kSTANDARD: j["engine_capability"] = "STANDARD"; break;
+        case nvinfer1::EngineCapability::kSAFETY: j["engine_capability"] = "SAFETY"; break;
+        case nvinfer1::EngineCapability::kDLA_STANDALONE: j["engine_capability"] = "DLA_STANDALONE"; break;
+        default: break;
+        }
+    }
+    if (params.hardwareCompatibilityLevel)
+    {
+        switch (*params.hardwareCompatibilityLevel)
+        {
+        case nvinfer1::HardwareCompatibilityLevel::kNONE: j["hardware_compatibility_level"] = "NONE"; break;
+        case nvinfer1::HardwareCompatibilityLevel::kAMPERE_PLUS: j["hardware_compatibility_level"] = "AMPERE_PLUS"; break;
+        case nvinfer1::HardwareCompatibilityLevel::kSAME_COMPUTE_CAPABILITY: j["hardware_compatibility_level"] = "SAME_COMPUTE_CAPABILITY"; break;
+        default: break;
+        }
+    }
+
+    auto device_name = [](nvinfer1::DeviceType type) { return type == nvinfer1::DeviceType::kDLA ? "DLA" : "GPU"; };
+    if (params.defaultDeviceType) j["default_device_type"] = device_name(*params.defaultDeviceType);
+    if (!params.layerDeviceTypes.empty())
+    {
+        json layers = json::object();
+        for (const auto& [layer, type] : params.layerDeviceTypes) layers[layer] = device_name(type);
+        j["layer_device_types"] = std::move(layers);
+    }
+
+    if (params.runtimePlatform)
+    {
+        switch (*params.runtimePlatform)
+        {
+        case nvinfer1::RuntimePlatform::kSAME_AS_BUILD: j["runtime_platform"] = "SAME_AS_BUILD"; break;
+        case nvinfer1::RuntimePlatform::kWINDOWS_AMD64: j["runtime_platform"] = "WINDOWS_AMD64"; break;
+        default: break;
+        }
+    }
+    if (params.tilingOptimizationLevel)
+    {
+        switch (*params.tilingOptimizationLevel)
+        {
+        case nvinfer1::TilingOptimizationLevel::kNONE: j["tiling_optimization_level"] = "NONE"; break;
+        case nvinfer1::TilingOptimizationLevel::kFAST: j["tiling_optimization_level"] = "FAST"; break;
+        case nvinfer1::TilingOptimizationLevel::kMODERATE: j["tiling_optimization_level"] = "MODERATE"; break;
+        case nvinfer1::TilingOptimizationLevel::kFULL: j["tiling_optimization_level"] = "FULL"; break;
+        default: break;
+        }
+    }
+    if (params.tilingL2Limit) j["tiling_l2_limit"] = *params.tilingL2Limit;
+
+    if (!params.previewFeatures.empty())
+    {
+        json features = json::object();
+        for (const auto& [feature, enabled] : params.previewFeatures)
+        {
+            if (feature == nvinfer1::PreviewFeature::kALIASED_PLUGIN_IO_10_03) features["ALIASED_PLUGIN_IO_10_03"] = enabled;
+            else if (feature == nvinfer1::PreviewFeature::kRUNTIME_ACTIVATION_RESIZE_10_10) features["RUNTIME_ACTIVATION_RESIZE_10_10"] = enabled;
+        }
+        j["preview_features"] = std::move(features);
+    }
+
+    if (!params.pluginsToSerialize.empty()) j["plugins_to_serialize"] = params.pluginsToSerialize;
+    j["allow_gpu_fallback"] = params.allowGpuFallback;
+
+    // workspace_size is reported through memory_pool_limits.WORKSPACE.
+    if (!params.memoryPoolLimits.empty())
+    {
+        json pools = json::object();
+        for (const auto& [pool, limit] : params.memoryPoolLimits)
+            if (const auto* name = name_of(memory_pool_names(), pool)) pools[*name] = limit;
+        j["memory_pool_limits"] = std::move(pools);
+    }
+
+    if (!params.engineFile.empty()) j["engine_file"] = params.engineFile;
+
+    // rs_inference_runner_create always seeds dataDirs with "" (use the model
+    // path as given); only report the directories the caller added.
+    json dirs = json::array();
+    for (const auto& dir : params.dataDirs)
+        if (!dir.empty()) dirs.push_back(dir);
+    if (!dirs.empty()) j["data_dirs"] = std::move(dirs);
+
+    if (!params.profile.empty())
+    {
+        json profile = json::object();
+        for (const auto& [name, dims] : params.profile)
+            profile[name] = { {"min", dims_to_json(dims.min)}, {"opt", dims_to_json(dims.opt)}, {"max", dims_to_json(dims.max)} };
+        j["profile"] = std::move(profile);
+    }
+    return j;
+}
+
+static void set_error(RSInferError* error, int code, const std::string& message)
+{
+    if (!error) return;
+    error->code = code;
+    error->message = strdup(message.c_str());
+}
+
+//! Converts tensors to a caller-owned RSInferTensorArray. Returns nullptr and sets
+//! `error` on allocation failure.
+static RSInferTensorArray* make_tensor_array(const std::vector<rsinfer::Tensor>& tensors, RSInferError* error)
+{
+    RSInferTensorArray* array = rs_infer_tensorarray_create(tensors.size());
+    if (!array)
+    {
+        set_error(error, ERROR_CODE_CREATION_FAILED, "Failed to allocate memory for RSInferTensorArray");
+        return nullptr;
+    }
+
+    for (size_t i = 0; i < tensors.size(); ++i)
+    {
+        const auto& tensor = tensors[i];
+        RSInferUCharArray* data_array = rs_infer_uchararray_create(tensor.data.size());
+        if (!data_array)
+        {
+            set_error(error, ERROR_CODE_CREATION_FAILED, "Failed to allocate memory for RSInferUCharArray");
+            rs_infer_tensorarray_destroy(array);
+            return nullptr;
+        }
+        if (!tensor.data.empty())
+            memcpy(data_array->data, tensor.data.data(), tensor.data.size());
+        RSInferLLArray* shape_array = rs_infer_llarray_create(tensor.shape.size());
+        if (!shape_array)
+        {
+            set_error(error, ERROR_CODE_CREATION_FAILED, "Failed to allocate memory for RSInferLLArray");
+            rs_infer_uchararray_destroy(data_array);
+            rs_infer_tensorarray_destroy(array);
+            return nullptr;
+        }
+        for (size_t d = 0; d < tensor.shape.size(); ++d)
+            shape_array->data[d] = static_cast<long long>(tensor.shape[d]);
+        array->tensors[i] = rs_infer_tensor_create(tensor.name.c_str(), tensor.name.size(), rsinfer::to_public_data_type(tensor.dtype), data_array, shape_array);
+        if (!array->tensors[i])
+        {
+            // `rs_infer_tensor_create` did not take ownership on failure.
+            set_error(error, ERROR_CODE_CREATION_FAILED, "Failed to allocate memory for RSInferTensor");
+            rs_infer_uchararray_destroy(data_array);
+            rs_infer_llarray_destroy(shape_array);
+            rs_infer_tensorarray_destroy(array);
+            return nullptr;
+        }
+    }
+    return array;
 }
 
 RSInferenceRunner* rs_inference_runner_create(const char* model_path, const char* json_config_str, RSInferError* error)
@@ -640,64 +815,7 @@ RSInferTensorArray* rs_inference_runner_get_results(RSInferenceRunner* runner, R
         auto tensorrtrunner = static_cast<rsinfer::TensorRTRunner*>(runner->runner);
         std::vector<rsinfer::Tensor> outputs;
         tensorrtrunner->get(outputs);
-
-        RSInferTensorArray* output_array = rs_infer_tensorarray_create(outputs.size());
-        if (!output_array)
-        {
-            if (error)
-            {
-                error->code = ERROR_CODE_CREATION_FAILED;
-                error->message = strdup("Failed to allocate memory for RSInferTensorArray");
-            }
-            return nullptr;
-        }
-
-        for (size_t i = 0; i < outputs.size(); ++i)
-        {
-            const auto& tensor = outputs[i];
-            RSInferUCharArray* data_array = rs_infer_uchararray_create(tensor.data.size());
-            if (!data_array)
-            {
-                if (error)
-                {
-                    error->code = ERROR_CODE_CREATION_FAILED;
-                    error->message = strdup("Failed to allocate memory for RSInferUCharArray");
-                }
-                rs_infer_tensorarray_destroy(output_array);
-                return nullptr;
-            }
-            memcpy(data_array->data, tensor.data.data(), tensor.data.size());
-            RSInferLLArray* shape_array = rs_infer_llarray_create(tensor.shape.size());
-            if (!shape_array)
-            {
-                if (error)
-                {
-                    error->code = ERROR_CODE_CREATION_FAILED;
-                    error->message = strdup("Failed to allocate memory for RSInferLLArray");
-                }
-                rs_infer_uchararray_destroy(data_array);
-                rs_infer_tensorarray_destroy(output_array);
-                return nullptr;
-            }
-            for (size_t d = 0; d < tensor.shape.size(); ++d)
-                shape_array->data[d] = static_cast<long long>(tensor.shape[d]);
-            output_array->tensors[i] = rs_infer_tensor_create(tensor.name.c_str(), tensor.name.size(), rsinfer::to_public_data_type(tensor.dtype), data_array, shape_array);
-            if (!output_array->tensors[i])
-            {
-                // `rs_infer_tensor_create` did not take ownership on failure.
-                if (error)
-                {
-                    error->code = ERROR_CODE_CREATION_FAILED;
-                    error->message = strdup("Failed to allocate memory for RSInferTensor");
-                }
-                rs_infer_uchararray_destroy(data_array);
-                rs_infer_llarray_destroy(shape_array);
-                rs_infer_tensorarray_destroy(output_array);
-                return nullptr;
-            }
-        }
-
-        return output_array;
+        return make_tensor_array(outputs, error);
     }
     catch (const std::exception& e)
     {
@@ -710,211 +828,82 @@ RSInferTensorArray* rs_inference_runner_get_results(RSInferenceRunner* runner, R
     }
 }
 
-RSInferIntArray* rs_inference_runner_get_input_shape(RSInferenceRunner* runner, unsigned index, RSInferError* error)
+static rsinfer::TensorRTRunner* get_tensorrt_runner(RSInferenceRunner* runner)
 {
-    if (!runner)
-    {
-        if (error)
-        {
-            error->code = ERROR_CODE_INVALID_ARGUMENTS;
-            error->message = strdup("Runner cannot be null");
-        }
-        return nullptr;
-    }
+    if (!runner || !runner->runner || runner->backend != RSInferenceBackend_TensorRT)
+        throw std::invalid_argument("Runner is null or is not a TensorRT runner");
+    return static_cast<rsinfer::TensorRTRunner*>(runner->runner);
+}
 
+RSInferTensorArray* rs_inference_runner_get_input_tensors_info(RSInferenceRunner* runner, RSInferError* error)
+{
     try
     {
-        auto tensorrtrunner = static_cast<rsinfer::TensorRTRunner*>(runner->runner);
-        std::vector<int> shape = tensorrtrunner->get_input_shape(index);
-
-        RSInferIntArray* shape_array = rs_infer_intarray_create(shape.size());
-        if (!shape_array)
+        const auto infos = get_tensorrt_runner(runner)->get_input_tensors_info();
+        if (!infos.has_value())
         {
-            if (error)
-            {
-                error->code = ERROR_CODE_CREATION_FAILED;
-                error->message = strdup("Failed to allocate memory for RSInferIntArray");
-            }
+            set_error(error, ERROR_CODE_INFERENCE_FAILED, "Failed to get TensorRT input tensors info: " + infos.error());
             return nullptr;
         }
-        memcpy(shape_array->data, shape.data(), shape.size() * sizeof(int));
-
-        return shape_array;
+        // Info tensors carry name, dtype and shape only; their data arrays are empty.
+        // Dynamic dimensions are reported as -1.
+        return make_tensor_array(infos.value(), error);
+    }
+    catch (const std::invalid_argument& e)
+    {
+        set_error(error, ERROR_CODE_INVALID_ARGUMENTS, e.what());
+        return nullptr;
     }
     catch (const std::exception& e)
     {
-        if (error)
-        {
-            error->code = ERROR_CODE_INFERENCE_FAILED;
-            error->message = strdup(("Failed to get input shape: " + std::string(e.what())).c_str());
-        }
+        set_error(error, ERROR_CODE_INFERENCE_FAILED, std::string("Failed to get TensorRT input tensors info: ") + e.what());
         return nullptr;
     }
 }
 
-RSInferIntArray* rs_inference_runner_get_output_shape(RSInferenceRunner* runner, unsigned index, RSInferError* error)
+RSInferTensorArray* rs_inference_runner_get_output_tensors_info(RSInferenceRunner* runner, RSInferError* error)
 {
-    if (!runner)
-    {
-        if (error)
-        {
-            error->code = ERROR_CODE_INVALID_ARGUMENTS;
-            error->message = strdup("Runner cannot be null");
-        }
-        return nullptr;
-    }
-
     try
     {
-        auto tensorrtrunner = static_cast<rsinfer::TensorRTRunner*>(runner->runner);
-        std::vector<int> shape = tensorrtrunner->get_output_shape(index);
-
-        RSInferIntArray* shape_array = rs_infer_intarray_create(shape.size());
-        if (!shape_array)
+        const auto infos = get_tensorrt_runner(runner)->get_output_tensors_info();
+        if (!infos.has_value())
         {
-            if (error)
-            {
-                error->code = ERROR_CODE_CREATION_FAILED;
-                error->message = strdup("Failed to allocate memory for RSInferIntArray");
-            }
+            set_error(error, ERROR_CODE_INFERENCE_FAILED, "Failed to get TensorRT output tensors info: " + infos.error());
             return nullptr;
         }
-        memcpy(shape_array->data, shape.data(), shape.size() * sizeof(int));
-
-        return shape_array;
+        // Info tensors carry name, dtype and shape only; their data arrays are empty.
+        // Dynamic dimensions are reported as -1.
+        return make_tensor_array(infos.value(), error);
+    }
+    catch (const std::invalid_argument& e)
+    {
+        set_error(error, ERROR_CODE_INVALID_ARGUMENTS, e.what());
+        return nullptr;
     }
     catch (const std::exception& e)
     {
-        if (error)
-        {
-            error->code = ERROR_CODE_INFERENCE_FAILED;
-            error->message = strdup(("Failed to get output shape: " + std::string(e.what())).c_str());
-        }
+        set_error(error, ERROR_CODE_INFERENCE_FAILED, std::string("Failed to get TensorRT output tensors info: ") + e.what());
         return nullptr;
     }
 }
 
-RSInferDataType rs_inference_runner_get_tensor_data_type(RSInferenceRunner* runner, const char* tensor_name, RSInferError* error)
+char* rs_inference_runner_get_json_config(RSInferenceRunner* runner, RSInferError* error)
 {
-    if (!runner || !tensor_name)
-    {
-        if (error)
-        {
-            error->code = ERROR_CODE_INVALID_ARGUMENTS;
-            error->message = strdup("Runner or tensor name cannot be null");
-        }
-        return RSInferDataType_Unknown;
-    }
-
     try
     {
-        auto tensorrtrunner = static_cast<rsinfer::TensorRTRunner*>(runner->runner);
-        nvinfer1::DataType data_type = tensorrtrunner->get_tensor_data_type(tensor_name);
-        return tensorrt_data_type_to_public(data_type);
+        char* result = strdup(config_to_json(get_tensorrt_runner(runner)->get_config()).dump().c_str());
+        if (!result)
+            set_error(error, ERROR_CODE_CREATION_FAILED, "Failed to allocate TensorRT JSON config string");
+        return result; // freed by the caller with rs_infer_string_free
     }
-    catch (const std::exception& e)
+    catch (const std::invalid_argument& e)
     {
-        if (error)
-        {
-            error->code = ERROR_CODE_INFERENCE_FAILED;
-            error->message = strdup(("Failed to get tensor data type: " + std::string(e.what())).c_str());
-        }
-        return RSInferDataType_Unknown;
-    }
-}
-
-size_t rs_inference_runner_get_tensor_data_size(RSInferenceRunner* runner, RSInferDataType data_type, RSInferError* error)
-{
-    if (!runner)
-    {
-        if (error)
-        {
-            error->code = ERROR_CODE_INVALID_ARGUMENTS;
-            error->message = strdup("Runner cannot be null");
-        }
-        return 0;
-    }
-
-    try
-    {
-        auto tensorrtrunner = static_cast<rsinfer::TensorRTRunner*>(runner->runner);
-        nvinfer1::DataType trt_data_type;
-        if (!public_data_type_to_tensorrt(data_type, trt_data_type))
-        {
-            if (error)
-            {
-                error->code = ERROR_CODE_INVALID_ARGUMENTS;
-                error->message = strdup("Unsupported tensor data type");
-            }
-            return 0;
-        }
-        return tensorrtrunner->get_tensor_data_size(trt_data_type);
-    }
-    catch (const std::exception& e)
-    {
-        if (error)
-        {
-            error->code = ERROR_CODE_INFERENCE_FAILED;
-            error->message = strdup(("Failed to get tensor data size: " + std::string(e.what())).c_str());
-        }
-        return 0;
-    }
-}
-
-const char* rs_inference_runner_get_input_tensor_name(RSInferenceRunner* runner, unsigned index, RSInferError* error)
-{
-    if (!runner)
-    {
-        if (error)
-        {
-            error->code = ERROR_CODE_INVALID_ARGUMENTS;
-            error->message = strdup("Runner cannot be null");
-        }
+        set_error(error, ERROR_CODE_INVALID_ARGUMENTS, e.what());
         return nullptr;
     }
-
-    try
-    {
-        auto tensorrtrunner = static_cast<rsinfer::TensorRTRunner*>(runner->runner);
-        std::string name = tensorrtrunner->get_input_tensor_name(index);
-        return strdup(name.c_str());
-    }
     catch (const std::exception& e)
     {
-        if (error)
-        {
-            error->code = ERROR_CODE_INFERENCE_FAILED;
-            error->message = strdup(("Failed to get input tensor name: " + std::string(e.what())).c_str());
-        }
-        return nullptr;
-    }
-}
-
-const char* rs_inference_runner_get_output_tensor_name(RSInferenceRunner* runner, unsigned index, RSInferError* error)
-{
-    if (!runner)
-    {
-        if (error)
-        {
-            error->code = ERROR_CODE_INVALID_ARGUMENTS;
-            error->message = strdup("Runner cannot be null");
-        }
-        return nullptr;
-    }
-
-    try
-    {
-        auto tensorrtrunner = static_cast<rsinfer::TensorRTRunner*>(runner->runner);
-        std::string name = tensorrtrunner->get_output_tensor_name(index);
-        return strdup(name.c_str());
-    }
-    catch (const std::exception& e)
-    {
-        if (error)
-        {
-            error->code = ERROR_CODE_INFERENCE_FAILED;
-            error->message = strdup(("Failed to get output tensor name: " + std::string(e.what())).c_str());
-        }
+        set_error(error, ERROR_CODE_INFERENCE_FAILED, std::string("Failed to get TensorRT JSON config: ") + e.what());
         return nullptr;
     }
 }

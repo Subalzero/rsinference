@@ -26,7 +26,7 @@
 //! and invalidates every function pointer it handed out.
 
 use libloading::Library;
-use std::os::raw::{c_char, c_int, c_uint};
+use std::os::raw::{c_char, c_int};
 use std::path::{Path, PathBuf};
 
 use crate::error::{EngineError, EngineResult, InferError, InferResult};
@@ -109,6 +109,25 @@ impl ffi::RSInferIntArray {
     }
 }
 
+impl ffi::RSInferTensorArray {
+    /// The tensor slots. Empty when `length == 0`, whose `tensors` may be NULL.
+    pub unsafe fn as_slice(&self) -> &[*mut ffi::RSInferTensor] {
+        if self.tensors.is_null() || self.length == 0 {
+            &[]
+        } else {
+            std::slice::from_raw_parts(self.tensors, self.length)
+        }
+    }
+
+    pub unsafe fn as_mut_slice(&mut self) -> &mut [*mut ffi::RSInferTensor] {
+        if self.tensors.is_null() || self.length == 0 {
+            &mut []
+        } else {
+            std::slice::from_raw_parts_mut(self.tensors, self.length)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Function-pointer types, mirroring cpp/include/public/rsinference.h exactly.
 // ---------------------------------------------------------------------------
@@ -128,7 +147,7 @@ type FnIntarrayDestroy = unsafe extern "C" fn(array: *mut ffi::RSInferIntArray);
 type FnErrorCleanmsg = unsafe extern "C" fn(error: *mut ffi::RSInferError);
 type FnAbiVersion = unsafe extern "C" fn() -> u32;
 
-const SUPPORTED_BRIDGE_ABI_VERSION: u32 = 2;
+const SUPPORTED_BRIDGE_ABI_VERSION: u32 = 3;
 
 type FnTensorCreate = unsafe extern "C" fn(
     name: *const c_char,
@@ -157,26 +176,17 @@ type FnRunnerGetResults = unsafe extern "C" fn(
     runner: *mut ffi::RSInferenceRunner,
     error: *mut ffi::RSInferError,
 ) -> *mut ffi::RSInferTensorArray;
-type FnRunnerGetShape = unsafe extern "C" fn(
+/// Shared by `get_input_tensors_info` and `get_output_tensors_info`: each tensor
+/// carries name, dtype and shape (dynamic dims as -1) and an empty data array.
+pub type FnRunnerGetTensorsInfo = unsafe extern "C" fn(
     runner: *mut ffi::RSInferenceRunner,
-    index: c_uint,
     error: *mut ffi::RSInferError,
-) -> *mut ffi::RSInferIntArray;
-type FnRunnerGetTensorDataType = unsafe extern "C" fn(
+) -> *mut ffi::RSInferTensorArray;
+/// Returns a string owned by the caller; free it with `rs_infer_string_free`.
+type FnRunnerGetJsonConfig = unsafe extern "C" fn(
     runner: *mut ffi::RSInferenceRunner,
-    tensor_name: *const c_char,
     error: *mut ffi::RSInferError,
-) -> ffi::RSInferDataType;
-type FnRunnerGetTensorDataSize = unsafe extern "C" fn(
-    runner: *mut ffi::RSInferenceRunner,
-    data_type: ffi::RSInferDataType,
-    error: *mut ffi::RSInferError,
-) -> usize;
-type FnRunnerGetTensorName = unsafe extern "C" fn(
-    runner: *mut ffi::RSInferenceRunner,
-    index: c_uint,
-    error: *mut ffi::RSInferError,
-) -> *const c_char;
+) -> *mut c_char;
 type FnStringFree = unsafe extern "C" fn(string: *const c_char);
 
 /// Every exported symbol of the bridge, resolved once at load time.
@@ -216,12 +226,9 @@ pub struct Bridge {
     pub runner_infer: FnRunnerInfer,
     pub runner_infer_async: FnRunnerInfer,
     pub runner_get_results: FnRunnerGetResults,
-    pub runner_get_input_shape: FnRunnerGetShape,
-    pub runner_get_output_shape: FnRunnerGetShape,
-    pub runner_get_tensor_data_type: FnRunnerGetTensorDataType,
-    pub runner_get_tensor_data_size: FnRunnerGetTensorDataSize,
-    pub runner_get_input_tensor_name: FnRunnerGetTensorName,
-    pub runner_get_output_tensor_name: FnRunnerGetTensorName,
+    pub runner_get_input_tensors_info: FnRunnerGetTensorsInfo,
+    pub runner_get_output_tensors_info: FnRunnerGetTensorsInfo,
+    pub runner_get_json_config: FnRunnerGetJsonConfig,
 }
 
 /// Raw function pointers are not `Debug`, so this reports the loaded DLL only.
@@ -302,36 +309,17 @@ impl Bridge {
                 runner_infer: lookup(&lib, b"rs_inference_runner_infer", display)?,
                 runner_infer_async: lookup(&lib, b"rs_inference_runner_infer_async", display)?,
                 runner_get_results: lookup(&lib, b"rs_inference_runner_get_results", display)?,
-                runner_get_input_shape: lookup(
+                runner_get_input_tensors_info: lookup(
                     &lib,
-                    b"rs_inference_runner_get_input_shape",
+                    b"rs_inference_runner_get_input_tensors_info",
                     display,
                 )?,
-                runner_get_output_shape: lookup(
+                runner_get_output_tensors_info: lookup(
                     &lib,
-                    b"rs_inference_runner_get_output_shape",
+                    b"rs_inference_runner_get_output_tensors_info",
                     display,
                 )?,
-                runner_get_tensor_data_type: lookup(
-                    &lib,
-                    b"rs_inference_runner_get_tensor_data_type",
-                    display,
-                )?,
-                runner_get_tensor_data_size: lookup(
-                    &lib,
-                    b"rs_inference_runner_get_tensor_data_size",
-                    display,
-                )?,
-                runner_get_input_tensor_name: lookup(
-                    &lib,
-                    b"rs_inference_runner_get_input_tensor_name",
-                    display,
-                )?,
-                runner_get_output_tensor_name: lookup(
-                    &lib,
-                    b"rs_inference_runner_get_output_tensor_name",
-                    display,
-                )?,
+                runner_get_json_config: lookup(&lib, b"rs_inference_runner_get_json_config", display)?,
                 path,
                 lib,
             })
