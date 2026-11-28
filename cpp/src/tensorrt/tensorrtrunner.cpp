@@ -65,6 +65,23 @@ namespace rsinfer
 			return h;
 		}
 
+		void check_cuda(cudaError_t status, const char* what)
+		{
+			if (status != cudaSuccess)
+				throw std::runtime_error(std::string(what) + " failed: " + cudaGetErrorString(status));
+		}
+
+		//! Transient graph capture failures after which a context stops trying.
+		constexpr uint32_t kMaxTransientCaptureFailures = 3;
+
+		int64_t volume(const nvinfer1::Dims& dims)
+		{
+			int64_t v = 1;
+			for (int32_t i = 0; i < dims.nbDims; ++i)
+				v *= dims.d[i];
+			return v;
+		}
+
 		//! "<model>.engine" for static builds, "<model>.dynamic-<profile hash>.engine"
 		//! for dynamic ones, so changing the profile never reuses an engine built
 		//! for other shape ranges. Splits at the last '.', not the first, so
@@ -107,37 +124,18 @@ namespace rsinfer
 
 	TensorRTRunner::~TensorRTRunner()
 	{
-		// Wait for detached process_async threads, which still use `this`.
-		std::unique_lock<std::mutex> lock(_inflight_mut);
-		_inflight_cond.wait(lock, [&]() { return _inflight == 0; });
+		// Stream callbacks of process_async requests still use `this`.
+		{
+			std::unique_lock<std::mutex> lock(_inflight_mut);
+			_inflight_cond.wait(lock, [&]() { return _inflight == 0; });
+		}
+		release_slots();
 	}
 
 	TensorRTRunner::TensorRTRunner(const RunnerParams& params) :
 		_params(params)
 	{
 
-	}
-
-	TensorRTRunner::TensorRTRunner(TensorRTRunner&& temp) noexcept
-	{
-		_params = std::move(temp._params);
-		_engine = std::move(temp._engine);
-		_runtime = std::move(temp._runtime);
-
-		temp._engine.reset();
-		temp._runtime.reset();
-	}
-
-	TensorRTRunner& TensorRTRunner::operator=(TensorRTRunner&& temp) noexcept
-	{
-		_params = std::move(temp._params);
-		_engine = std::move(temp._engine);
-		_runtime = std::move(temp._runtime);
-
-		temp._engine.reset();
-		temp._runtime.reset();
-
-		return *this;
 	}
 
 	bool TensorRTRunner::build(const std::function<bool(IOptimizationProfile*)>& optimization)
@@ -304,185 +302,555 @@ namespace rsinfer
 				return false;
 		}
 
-		uint32_t nireq = _params.nContexts;
-		for (uint32_t i = 0; i < nireq; ++i)
+		return init_slots();
+	}
+
+	bool TensorRTRunner::init_slots()
+	{
+		release_slots();
+		_io.clear();
+		_input_order.clear();
+		_output_order.clear();
+
+		for (int32_t i = 0, n = _engine->getNbIOTensors(); i < n; ++i)
 		{
-			nvinfer1::IExecutionContext* ctx = _engine->createExecutionContext();
-			if (!ctx)
+			const char* name = _engine->getIOTensorName(i);
+			// Buffers are sized and filled as dense row-major tensors. Vectorized
+			// or channel-last I/O formats need padded buffers and a different
+			// data layout, so refuse them instead of reading or writing out of bounds.
+			if (_engine->getTensorFormat(name) != nvinfer1::TensorFormat::kLINEAR
+				|| _engine->getTensorVectorizedDim(name) != -1)
 			{
+				sample::gLogError << "I/O tensor '" << name << "' uses the non-linear format "
+					<< _engine->getTensorFormatDesc(name)
+					<< "; only linear (row-major) I/O tensors are supported" << std::endl;
 				return false;
 			}
-			_execution_contexts.emplace_back(ctx);
-			_idle_contexts.push(ctx);
+			_io.push_back({ name, _engine->getTensorIOMode(name) == TensorIOMode::kINPUT, _engine->getTensorDataType(name) });
+		}
+		auto index_of = [this](const std::string& name) -> std::optional<size_t>
+		{
+			for (size_t i = 0; i < _io.size(); ++i)
+				if (_io[i].name == name) return i;
+			return std::nullopt;
+		};
+		for (uint32_t i = 0, n = static_cast<uint32_t>(get_number_of_inputs()); i < n; ++i)
+		{
+			auto idx = index_of(get_input_tensor_name(i));
+			if (!idx) return false;
+			_input_order.push_back(*idx);
+		}
+		for (uint32_t i = 0, n = static_cast<uint32_t>(get_number_of_outputs()); i < n; ++i)
+		{
+			auto idx = index_of(get_output_tensor_name(i));
+			if (!idx) return false;
+			_output_order.push_back(*idx);
 		}
 
+		try
+		{
+			for (uint32_t i = 0; i < _params.nContexts; ++i)
+			{
+				auto slot = std::make_unique<Slot>();
+				slot->owner = this;
+				slot->context.reset(_engine->createExecutionContext());
+				if (!slot->context)
+				{
+					release_slots();
+					return false;
+				}
+				check_cuda(cudaStreamCreateWithFlags(&slot->stream, cudaStreamNonBlocking), "cudaStreamCreateWithFlags");
+				slot->buffers.resize(_io.size());
+				// Pre-allocate buffers for tensors whose shape is static, so the first
+				// request does not pay for allocation. Dynamic ones grow on demand.
+				for (size_t t = 0; t < _io.size(); ++t)
+				{
+					const nvinfer1::Dims dims = _engine->getTensorShape(_io[t].name.c_str());
+					bool is_static = true;
+					for (int32_t d = 0; d < dims.nbDims; ++d)
+						is_static = is_static && dims.d[d] >= 0;
+					if (is_static)
+						ensure_capacity(slot->buffers[t], samplesCommon::getNbBytes(_io[t].type, volume(dims)));
+				}
+				_idle_slots.push(slot.get());
+				_slots.push_back(std::move(slot));
+			}
+		}
+		catch (const std::exception& e)
+		{
+			sample::gLogError << "Failed to create execution slots: " << e.what() << std::endl;
+			release_slots();
+			return false;
+		}
 		return true;
+	}
+
+	void TensorRTRunner::release_slots() noexcept
+	{
+		for (auto& slot : _slots)
+		{
+			if (slot->stream)
+				cudaStreamSynchronize(slot->stream);
+			destroy_graph(*slot);
+			for (auto& buffer : slot->buffers)
+			{
+				if (buffer.device) cudaFree(buffer.device);
+				if (buffer.host) cudaFreeHost(buffer.host);
+				buffer = {};
+			}
+			slot->context.reset();
+			if (slot->stream)
+				cudaStreamDestroy(slot->stream);
+		}
+		_slots.clear();
+		_idle_slots = {};
+	}
+
+	void TensorRTRunner::ensure_capacity(IOBuffer& buffer, size_t bytes)
+	{
+		// TensorRT wants a valid address even for an empty tensor.
+		const size_t needed = bytes == 0 ? 1 : bytes;
+		if (needed <= buffer.capacity)
+			return;
+		// The slot is owned exclusively and its stream is idle, so the old
+		// buffers are no longer in use.
+		if (buffer.device) cudaFree(buffer.device);
+		if (buffer.host) cudaFreeHost(buffer.host);
+		buffer.device = nullptr;
+		buffer.host = nullptr;
+		buffer.capacity = 0;
+		check_cuda(cudaMalloc(&buffer.device, needed), "cudaMalloc");
+		check_cuda(cudaHostAlloc(&buffer.host, needed, cudaHostAllocDefault), "cudaHostAlloc");
+		buffer.capacity = needed;
+	}
+
+	TensorRTRunner::Slot* TensorRTRunner::acquire_slot()
+	{
+		std::unique_lock<std::mutex> lock(_idle_slots_mut);
+		if (_slots.empty())
+			throw std::runtime_error("TensorRT runner has no execution contexts");
+		_idle_slots_cond.wait(lock, [&]() { return !_idle_slots.empty(); });
+		Slot* slot = _idle_slots.front();
+		_idle_slots.pop();
+		return slot;
+	}
+
+	void TensorRTRunner::return_slot(Slot* slot) noexcept
+	{
+		{
+			std::lock_guard<std::mutex> lock(_idle_slots_mut);
+			_idle_slots.push(slot);
+		}
+		_idle_slots_cond.notify_one();
+	}
+
+	TensorRTRunner::Slot* TensorRTRunner::enqueue(std::span<const TensorView> input_tensors)
+	{
+		if (input_tensors.size() != _input_order.size())
+		{
+			throw std::runtime_error("Expected " + std::to_string(_input_order.size()) + " input tensors, got "
+				+ std::to_string(input_tensors.size()));
+		}
+
+		Slot* slot = acquire_slot();
+		// On any failure, wait out whatever was already queued on the stream
+		// before the slot (and its buffers) can be reused.
+		struct SlotGuard
+		{
+			TensorRTRunner* self;
+			Slot* slot;
+			~SlotGuard()
+			{
+				if (!slot) return;
+				cudaStreamSynchronize(slot->stream);
+				self->return_slot(slot);
+			}
+		} guard{ this, slot };
+
+		nvinfer1::IExecutionContext* context = slot->context.get();
+
+		// Match each view to its engine input by name, then resolve its shape.
+		std::vector<size_t> view_io(input_tensors.size());
+		for (size_t v = 0; v < input_tensors.size(); ++v)
+		{
+			const TensorView& view = input_tensors[v];
+			size_t idx = _io.size();
+			for (size_t i : _input_order)
+			{
+				if (_io[i].name == view.name)
+				{
+					idx = i;
+					break;
+				}
+			}
+			if (idx == _io.size())
+				throw std::runtime_error("Unknown input tensor: " + std::string(view.name));
+			for (size_t u = 0; u < v; ++u)
+			{
+				if (view_io[u] == idx)
+					throw std::runtime_error("Input tensor given twice: " + std::string(view.name));
+			}
+			view_io[v] = idx;
+
+			if (view.dtype != to_inferrs_data_type(_io[idx].type))
+				throw std::runtime_error("Input tensor '" + _io[idx].name + "' has a data type that does not match the engine");
+			if (!context->setInputShape(_io[idx].name.c_str(), view.shape))
+				throw std::runtime_error("setInputShape failed for tensor: " + _io[idx].name);
+		}
+		if (!context->allInputDimensionsSpecified())
+			throw std::runtime_error("Not all input dimensions were specified");
+
+		// Size every buffer from the resolved shapes and bind it.
+		bool buffers_moved = false;
+		for (size_t i = 0; i < _io.size(); ++i)
+		{
+			IOBuffer& buffer = slot->buffers[i];
+			buffer.shape = context->getTensorShape(_io[i].name.c_str());
+			for (int32_t d = 0; d < buffer.shape.nbDims; ++d)
+			{
+				if (buffer.shape.d[d] < 0)
+					throw std::runtime_error("Unresolved dynamic dimension in tensor: " + _io[i].name);
+			}
+			buffer.bytes = samplesCommon::getNbBytes(_io[i].type, volume(buffer.shape));
+			const void* previous = buffer.device;
+			ensure_capacity(buffer, buffer.bytes);
+			buffers_moved = buffers_moved || buffer.device != previous;
+			if (!context->setTensorAddress(_io[i].name.c_str(), buffer.device))
+				throw std::runtime_error("setTensorAddress failed for tensor: " + _io[i].name);
+		}
+
+		// Copy in, step 1: caller memory -> pinned. The device copies are queued
+		// by record_work (directly or inside the slot's CUDA graph).
+		for (size_t v = 0; v < input_tensors.size(); ++v)
+		{
+			IOBuffer& buffer = slot->buffers[view_io[v]];
+			const auto& data = input_tensors[v].data;
+			if (data.size() != buffer.bytes)
+			{
+				throw std::runtime_error("Input tensor '" + _io[view_io[v]].name + "' has " + std::to_string(data.size())
+					+ " bytes, expected " + std::to_string(buffer.bytes));
+			}
+			if (!data.empty())
+				std::memcpy(buffer.host, data.data(), data.size());
+		}
+
+		// The graph is only valid for the shapes it was recorded with.
+		std::vector<int64_t> key;
+		for (size_t i : _input_order)
+		{
+			const nvinfer1::Dims& shape = slot->buffers[i].shape;
+			key.push_back(shape.nbDims);
+			key.insert(key.end(), shape.d, shape.d + shape.nbDims);
+		}
+		launch(*slot, std::move(key), buffers_moved);
+
+		guard.slot = nullptr; // queued successfully; the caller owns the slot now
+		return slot;
+	}
+
+	void TensorRTRunner::record_work(Slot& slot)
+	{
+		for (size_t i : _input_order)
+		{
+			IOBuffer& buffer = slot.buffers[i];
+			check_cuda(cudaMemcpyAsync(buffer.device, buffer.host, buffer.bytes, cudaMemcpyHostToDevice, slot.stream),
+				"cudaMemcpyAsync (host to device)");
+		}
+
+		if (!slot.context->enqueueV3(slot.stream))
+			throw std::runtime_error("enqueueV3 failed");
+
+		for (size_t i : _output_order)
+		{
+			IOBuffer& buffer = slot.buffers[i];
+			check_cuda(cudaMemcpyAsync(buffer.host, buffer.device, buffer.bytes, cudaMemcpyDeviceToHost, slot.stream),
+				"cudaMemcpyAsync (device to host)");
+		}
+	}
+
+	void TensorRTRunner::launch(Slot& slot, std::vector<int64_t>&& key, bool buffers_moved)
+	{
+		const bool same_shapes = key == slot.graph_key;
+		if (!same_shapes || buffers_moved)
+		{
+			// New shapes or new buffers: the recorded graph no longer applies.
+			destroy_graph(slot);
+			slot.ran_direct = false;
+			slot.graph_key = std::move(key);
+		}
+
+		if (slot.graph)
+		{
+			check_cuda(cudaGraphLaunch(slot.graph, slot.stream), "cudaGraphLaunch");
+			return;
+		}
+
+		// TensorRT may do deferred setup in the first enqueueV3 after a shape
+		// change, so a shape is captured only once it has run directly.
+		if (_params.cudaGraph && !slot.graph_unsupported && slot.ran_direct)
+		{
+			switch (capture_graph(slot))
+			{
+			case CaptureResult::Captured:
+				check_cuda(cudaGraphLaunch(slot.graph, slot.stream), "cudaGraphLaunch");
+				return;
+			case CaptureResult::Unsupported:
+				slot.graph_unsupported = true;
+				sample::gLogWarning << "CUDA graph capture is not supported for this engine; using enqueueV3 directly" << std::endl;
+				break;
+			case CaptureResult::Transient:
+				// Retry on a later request, but stop trying if it keeps failing.
+				if (++slot.transient_capture_failures >= kMaxTransientCaptureFailures)
+				{
+					slot.graph_unsupported = true;
+					sample::gLogWarning << "CUDA graph capture failed " << kMaxTransientCaptureFailures
+						<< " times; using enqueueV3 directly" << std::endl;
+				}
+				break;
+			}
+		}
+
+		record_work(slot);
+		slot.ran_direct = true;
+	}
+
+	TensorRTRunner::CaptureResult TensorRTRunner::capture_graph(Slot& slot)
+	{
+		// Thread-local mode: other threads may allocate (other slots growing
+		// their buffers) while this stream is being captured.
+		if (cudaStreamBeginCapture(slot.stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess)
+		{
+			cudaGetLastError();
+			return CaptureResult::Transient;
+		}
+
+		bool recorded = true;
+		try
+		{
+			record_work(slot);
+		}
+		catch (const std::exception& e)
+		{
+			sample::gLogWarning << "CUDA graph capture failed: " << e.what() << std::endl;
+			recorded = false;
+		}
+
+		// Always end the capture, or the stream stays unusable.
+		cudaGraph_t graph = nullptr;
+		const cudaError_t end_status = cudaStreamEndCapture(slot.stream, &graph);
+		if (!recorded || end_status != cudaSuccess || !graph)
+		{
+			// The engine's work itself could not be recorded (e.g. it calls
+			// something capture does not allow): retrying will not help.
+			if (graph)
+				cudaGraphDestroy(graph);
+			cudaGetLastError(); // capture errors are not sticky; clear them
+			return CaptureResult::Unsupported;
+		}
+
+		cudaGraphExec_t exec = nullptr;
+		const cudaError_t instantiate_status = cudaGraphInstantiate(&exec, graph, 0);
+		cudaGraphDestroy(graph);
+		if (instantiate_status != cudaSuccess)
+		{
+			if (exec)
+				cudaGraphExecDestroy(exec);
+			cudaGetLastError();
+			sample::gLogWarning << "cudaGraphInstantiate failed: " << cudaGetErrorString(instantiate_status) << std::endl;
+			return CaptureResult::Transient;
+		}
+		slot.graph = exec;
+		return CaptureResult::Captured;
+	}
+
+	void TensorRTRunner::destroy_graph(Slot& slot) noexcept
+	{
+		if (slot.graph)
+		{
+			cudaGraphExecDestroy(slot.graph);
+			slot.graph = nullptr;
+		}
+	}
+
+	std::vector<Tensor> TensorRTRunner::collect_outputs(const Slot& slot) const
+	{
+		std::vector<Tensor> outputs;
+		outputs.reserve(_output_order.size());
+		for (size_t i : _output_order)
+		{
+			const IOBuffer& buffer = slot.buffers[i];
+			const auto* bytes = static_cast<const unsigned char*>(buffer.host);
+			Tensor out;
+			out.name = _io[i].name;
+			out.shape.assign(buffer.shape.d, buffer.shape.d + buffer.shape.nbDims);
+			out.data.assign(bytes, bytes + buffer.bytes);
+			out.dtype = to_inferrs_data_type(_io[i].type);
+			outputs.push_back(std::move(out));
+		}
+		return outputs;
+	}
+
+	uint64_t TensorRTRunner::reserve_ticket()
+	{
+		std::lock_guard<std::mutex> lock(_completions_mut);
+		return _completions.reserve();
+	}
+
+	void TensorRTRunner::complete_ticket(uint64_t ticket, Completion completion) noexcept
+	{
+		{
+			std::lock_guard<std::mutex> lock(_completions_mut);
+			try
+			{
+				_completions.complete(ticket, std::move(completion));
+			}
+			catch (...)
+			{
+				// Out of memory storing the result: report it as an error rather
+				// than leaving get() waiting for this ticket forever.
+				_completions.cancel(ticket);
+				sample::gLogError << "Could not store an inference result" << std::endl;
+			}
+		}
+		_completions_cond.notify_all();
+	}
+
+	void TensorRTRunner::cancel_ticket(uint64_t ticket) noexcept
+	{
+		{
+			std::lock_guard<std::mutex> lock(_completions_mut);
+			_completions.cancel(ticket);
+		}
+		_completions_cond.notify_all();
+	}
+
+	std::vector<TensorView> TensorRTRunner::views_of(const std::vector<Tensor>& tensors)
+	{
+		std::vector<TensorView> views;
+		views.reserve(tensors.size());
+		for (const auto& t : tensors)
+			views.push_back(TensorView::make(t.name, t.shape.data(), t.shape.size(), t.dtype, t.data));
+		return views;
 	}
 
 	void TensorRTRunner::process(const std::vector<Tensor>& input_tensors)
 	{
-		{
-			std::lock_guard<std::mutex> lock(_completions_mut);
-			++_pending_requests;
-		}
+		const auto views = views_of(input_tensors);
+		process(std::span<const TensorView>(views));
+	}
 
+	void TensorRTRunner::process(std::span<const TensorView> input_tensors)
+	{
+		// The ticket fixes this request's place in get()'s order.
+		const uint64_t ticket = reserve_ticket();
 		try
 		{
-			process_impl(input_tensors);
+			Slot* slot = enqueue(input_tensors);
+			const cudaError_t status = cudaStreamSynchronize(slot->stream);
+			std::optional<Completion> outputs;
+			try
+			{
+				check_cuda(status, "TensorRT inference");
+				outputs = collect_outputs(*slot);
+			}
+			catch (...)
+			{
+				return_slot(slot);
+				throw;
+			}
+			// Queue the result before freeing the slot, so a later request on
+			// this slot can never be ordered ahead of it.
+			complete_ticket(ticket, std::move(*outputs));
+			return_slot(slot);
 		}
 		catch (...)
 		{
-			finish_request();
+			// The error goes to this caller; get() skips the ticket.
+			cancel_ticket(ticket);
 			throw;
 		}
-
-		finish_request();
-	}
-
-	void TensorRTRunner::process_impl(const std::vector<Tensor>& input_tensors)
-	{
-		std::unique_lock<std::mutex> idle_context_lock(_idle_contexts_mut);
-		_idle_contexts_cond.wait(idle_context_lock, [&]() { return !_idle_contexts.empty(); });
-		nvinfer1::IExecutionContext* context = _idle_contexts.front();
-		_idle_contexts.pop();
-		idle_context_lock.unlock();
-
-		// Give the context back on every exit path, including exceptions.
-		struct ContextReturn
-		{
-			TensorRTRunner* self;
-			nvinfer1::IExecutionContext* ctx;
-			~ContextReturn()
-			{
-				std::lock_guard<std::mutex> lock(self->_idle_contexts_mut);
-				self->_idle_contexts.push(ctx);
-				self->_idle_contexts_cond.notify_one();
-			}
-		} context_return{ this, context };
-
-		// Resolve dynamic dimensions before any buffer is sized.
-		for (const auto& t : input_tensors)
-		{
-			std::vector<int> shape;
-			shape.reserve(t.shape.size());
-			for (auto dim : t.shape)
-			{
-				shape.push_back(static_cast<int>(dim));
-			}
-			if (!context->setInputShape(t.name.c_str(), vector_to_dims(shape)))
-			{
-				throw std::runtime_error("setInputShape failed for tensor: " + t.name);
-			}
-		}
-		if (!context->allInputDimensionsSpecified())
-		{
-			throw std::runtime_error("Not all input dimensions were specified");
-		}
-
-		// Create RAII buffer manager object, sized from the context's resolved shapes.
-		std::unique_lock<std::mutex> engine_lock(_engine_mut);
-		samplesCommon::BufferManager buffers(_engine, 0, context);
-		engine_lock.unlock();
-
-		for (int32_t i = 0, e = _engine->getNbIOTensors(); i < e; i++)
-		{
-			auto const name = _engine->getIOTensorName(i);
-			context->setTensorAddress(name, buffers.getDeviceBuffer(name));
-		}
-
-		process_input(buffers, context, input_tensors);
-
-		// Memcpy from host input buffers to device input buffers
-		buffers.copyInputToDevice();
-
-		context->executeV2(buffers.getDeviceBindings().data());
-
-		// Memcpy from device output buffers to host output buffers
-		buffers.copyOutputToHost();
-
-		verify_output(buffers, context);
 	}
 
 	void TensorRTRunner::process_async(const std::vector<Tensor>& input_tensors)
 	{
+		const auto views = views_of(input_tensors);
+		process_async(std::span<const TensorView>(views));
+	}
+
+	void TensorRTRunner::process_async(std::span<const TensorView> input_tensors)
+	{
+		const uint64_t ticket = reserve_ticket();
+		Slot* slot = nullptr;
+		try
 		{
-			std::lock_guard<std::mutex> lock(_completions_mut);
-			++_pending_requests;
+			slot = enqueue(input_tensors);
 		}
+		catch (...)
+		{
+			cancel_ticket(ticket);
+			throw;
+		}
+		slot->ticket = ticket;
+
 		{
 			std::lock_guard<std::mutex> lock(_inflight_mut);
 			++_inflight;
 		}
-
-		try
+		// The callback runs on a CUDA driver thread once copy-out has finished.
+		// It must not call CUDA, so it only copies the pinned outputs and
+		// hands the slot back.
+		const cudaError_t status = cudaStreamAddCallback(slot->stream, &TensorRTRunner::on_stream_complete, slot, 0);
+		if (status != cudaSuccess)
 		{
-			std::thread([this](std::vector<Tensor> inputs)
+			// Could not register the callback: finish the request here instead.
+			on_stream_complete(slot->stream, cudaStreamSynchronize(slot->stream), slot);
+		}
+	}
+
+	void CUDART_CB TensorRTRunner::on_stream_complete(cudaStream_t, cudaError_t status, void* user_data)
+	{
+		Slot* slot = static_cast<Slot*>(user_data);
+		TensorRTRunner* self = slot->owner;
+
+		Completion completion;
+		if (status != cudaSuccess)
+		{
+			completion = std::string("Asynchronous inference failed: ") + cudaGetErrorString(status);
+		}
+		else
+		{
+			try
 			{
-				try
-				{
-					process_impl(inputs);
-				}
-				catch (const std::exception& e)
-				{
-					{
-						std::lock_guard<std::mutex> lock(_completions_mut);
-						_completions.emplace(std::string(e.what()));
-					}
-					_completions_cond.notify_one();
-					sample::gLogError << "process_async failed: " << e.what() << std::endl;
-				}
-				catch (...)
-				{
-					{
-						std::lock_guard<std::mutex> lock(_completions_mut);
-						_completions.emplace(std::string("unknown asynchronous inference failure"));
-					}
-					_completions_cond.notify_one();
-					sample::gLogError << "process_async failed: unknown error" << std::endl;
-				}
-
-				finish_request();
-
-				std::lock_guard<std::mutex> lock(_inflight_mut);
-				--_inflight;
-				_inflight_cond.notify_all();
-			}, input_tensors).detach();
+				completion = self->collect_outputs(*slot);
+			}
+			catch (const std::exception& e)
+			{
+				completion = std::string("Asynchronous inference failed: ") + e.what();
+			}
 		}
-		catch (...)
-		{
-			finish_request();
-			std::lock_guard<std::mutex> lock(_inflight_mut);
-			--_inflight;
-			_inflight_cond.notify_all();
-			throw;
-		}
+
+		// Queue the result before freeing the slot (see process()). The slot's
+		// ticket must be read before return_slot hands it to another request.
+		self->complete_ticket(slot->ticket, std::move(completion));
+		self->return_slot(slot);
+
+		std::lock_guard<std::mutex> lock(self->_inflight_mut);
+		--self->_inflight;
+		self->_inflight_cond.notify_all();
 	}
 
 	void TensorRTRunner::get(std::vector<Tensor>& result)
 	{
 		std::unique_lock<std::mutex> completions_lock(_completions_mut);
-		_completions_cond.wait(completions_lock, [&]() {
-			return !_completions.empty() || _pending_requests == 0;
-		});
-		if (_completions.empty())
+		_completions_cond.wait(completions_lock, [&]() { return _completions.ready(); });
+		std::optional<Completion> completion = _completions.take();
+		completions_lock.unlock();
+		if (!completion)
 			throw std::runtime_error("No inference request is pending");
 
-		Completion completion = std::move(_completions.front());
-		_completions.pop();
-		completions_lock.unlock();
-
-		if (auto* error = std::get_if<std::string>(&completion))
+		if (auto* error = std::get_if<std::string>(&*completion))
 			throw std::runtime_error(*error);
-		result = std::move(std::get<std::vector<Tensor>>(completion));
-	}
-
-	void TensorRTRunner::finish_request()
-	{
-		{
-			std::lock_guard<std::mutex> lock(_completions_mut);
-			--_pending_requests;
-		}
-		_completions_cond.notify_all();
+		result = std::move(std::get<std::vector<Tensor>>(*completion));
 	}
 
 	std::vector<int> TensorRTRunner::get_input_shape(uint32_t index) const
@@ -670,92 +1038,6 @@ namespace rsinfer
 
 			samplesCommon::enableDLA(builder.get(), config.get(), _params.dlaCore, _params.allowGpuFallback);
 
-		return true;
-	}
-
-		bool TensorRTRunner::process_input(const samplesCommon::BufferManager& buffers, nvinfer1::IExecutionContext* context, const std::vector<Tensor>& tensors)
-	{
-		auto n_inputs = get_number_of_inputs();
-		std::size_t count = tensors.size();
-		if (count != n_inputs)
-		{
-			throw std::runtime_error("Expected " + std::to_string(n_inputs) + " input tensors, got " + std::to_string(count));
-		}
-		for (size_t i = 0; i < count; ++i)
-		{
-			auto& tensor = tensors[i];
-			std::string tensor_name = tensor.name;
-
-			std::vector<int> input_shape;
-			input_shape.reserve(tensor.shape.size());
-			for (auto dim : tensor.shape)
-			{
-				input_shape.push_back(static_cast<int>(dim));
-			}
-			context->setInputShape(tensor_name.c_str(), vector_to_dims(input_shape));
-
-			const nvinfer1::DataType engine_data_type = get_tensor_data_type(tensor_name);
-			if (tensor.dtype != to_inferrs_data_type(engine_data_type))
-			{
-				throw std::runtime_error("Input tensor '" + tensor_name + "' has a data type that does not match the engine");
-			}
-
-			size_t input_size = 1;
-			std::vector<int> input_dims = dims_to_vector(context->getTensorShape(tensor_name.c_str()));
-			for (size_t d = 0; d < input_dims.size(); ++d)
-			{
-				if (input_dims[d] < 0)
-				{
-					throw std::runtime_error("Unresolved dynamic dimension in tensor: " + tensor_name);
-				}
-				input_size *= input_dims[d];
-			}
-
-			const size_t nbytes = samplesCommon::getNbBytes(engine_data_type, static_cast<int64_t>(input_size));
-			if (tensor.data.size() != nbytes)
-			{
-				throw std::runtime_error("Input tensor '" + tensor_name + "' has " + std::to_string(tensor.data.size())
-					+ " bytes, expected " + std::to_string(nbytes));
-			}
-
-			auto hostDataBuffer = buffers.getHostBuffer(get_input_tensor_name(static_cast<uint32_t>(i)));
-
-			memcpy(hostDataBuffer, tensor.data.data(), nbytes);
-		}
-
-		return true;
-	}
-
-	bool TensorRTRunner::verify_output(const samplesCommon::BufferManager& buffers, const nvinfer1::IExecutionContext* context)
-	{
-		auto n_outputs = get_number_of_outputs();
-		std::vector<Tensor> output_vect;
-		for (uint32_t i = 0; i < n_outputs; ++i)
-		{
-			std::string tensor_name = get_output_tensor_name(i);
-			size_t output_size = 1;
-			std::vector<int> output_dims = dims_to_vector(context->getTensorShape(tensor_name.c_str()));
-			for (size_t d = 0; d < output_dims.size(); ++d)
-			{
-				assert(output_dims[d] != -1);
-				output_size *= output_dims[d];
-			}
-
-			unsigned char* output = static_cast<unsigned char*>(buffers.getHostBuffer(get_output_tensor_name(i)));
-
-			Tensor out;
-			const nvinfer1::DataType data_type = get_tensor_data_type(tensor_name);
-			const size_t output_bytes = samplesCommon::getNbBytes(data_type, static_cast<int64_t>(output_size));
-			out.name = tensor_name;
-			out.shape.assign(output_dims.begin(), output_dims.end());
-			out.data = std::vector<unsigned char>(output, output + output_bytes);
-			out.dtype = to_inferrs_data_type(data_type);
-
-			output_vect.push_back(std::move(out));
-		}
-		std::lock_guard<std::mutex> completions_lock(_completions_mut);
-		_completions.emplace(std::move(output_vect));
-		_completions_cond.notify_one();
 		return true;
 	}
 
