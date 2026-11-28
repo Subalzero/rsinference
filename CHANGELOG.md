@@ -14,6 +14,14 @@
   dropped from 5.2 ms to 2.3 ms (p50); see `examples/latency.rs`.
 - **`infer_async` no longer starts a thread per call.** The work is queued on a
   free context's stream and a stream callback collects the outputs.
+- **Rust no longer copies inputs before calling the bridge.** `infer` and
+  `infer_async` used to copy every input into arrays allocated by the bridge.
+  They now pass C views that point straight at the caller's `Tensor` buffers
+  (only the names are copied), which the ABI's read-only input contract already
+  allowed. Together with the change above, the synchronous TensorRT round trip
+  is now 0.93 ms (p50), down from 5.2 ms. This applies to every backend; no ABI
+  change. The header now states that input arrays may be caller-allocated and
+  are valid only until the call returns.
 
 ### Behavior changes (TensorRT)
 

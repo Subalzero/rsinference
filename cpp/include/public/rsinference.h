@@ -180,6 +180,9 @@ BACKEND_EXPORT void rs_inference_runner_destroy(RSInferenceRunner* runner);
  * using the provided input tensors and return the appropriate status code.
  * input_tensors and error are passed in from the Rust side, and you should NOT CONSUME or FREE them.
  * The Rust side will handle their memory management. You should only read from these structures and not attempt to free or modify them.
+ * They may be allocated by the caller rather than with the rs_infer_* helpers (the Rust crate points them straight at its own
+ * buffers), and they are only valid until this function returns: copy whatever you need before returning, including for
+ * the asynchronous call. Tensor names are NUL-terminated, and name_length excludes the terminator.
  * If you need to return results, use the rs_inference_runner_get_results function to retrieve the inference results.
  * If you need to return an error message, populate the RSInferError structure pointed to by the error parameter, 
  * but do not free it. The Rust side will handle the memory management of the error structure.
@@ -199,6 +202,9 @@ BACKEND_EXPORT int rs_inference_runner_infer(RSInferenceRunner* runner, RSInferT
  * using the provided input tensors and return the appropriate status code.
  * input_tensors and error are passed in from the Rust side, and you should NOT CONSUME or FREE them.
  * The Rust side will handle their memory management. You should only read from these structures and not attempt to free or modify them.
+ * They may be allocated by the caller rather than with the rs_infer_* helpers (the Rust crate points them straight at its own
+ * buffers), and they are only valid until this function returns: copy whatever you need before returning, including for
+ * the asynchronous call. Tensor names are NUL-terminated, and name_length excludes the terminator.
  * If you need to return results, use the rs_inference_runner_get_results function to retrieve the inference results.
  * If you need to return an error message, populate the RSInferError structure pointed to by the error parameter, 
  * but do not free it. The Rust side will handle the memory management of the error structure.

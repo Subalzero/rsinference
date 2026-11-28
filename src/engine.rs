@@ -1,14 +1,18 @@
 //! Engine handling shared by all backends.
 
 use std::cell::OnceCell;
-use std::ffi::{CStr, CString, c_int};
+use std::ffi::{CStr, CString, c_int, c_longlong};
 use std::hash::Hash;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
 use crate::dll::take_error;
 use crate::error::{DataResult, EngineError, EngineResult, InferError, InferResult};
-use crate::ffi::{RSInferError, RSInferTensor, RSInferTensorArray, RSInferenceRunner};
+use crate::ffi::{
+    RSInferDataType, RSInferError, RSInferLLArray, RSInferTensor, RSInferTensorArray, RSInferUCharArray,
+    RSInferenceRunner,
+};
 use crate::Bridge;
 use crate::types::*;
 use std::os::raw::c_char;
@@ -101,6 +105,79 @@ impl Drop for InferInstance<'_> {
             unsafe { (self.engine.bridge.runner_destroy)(self.runner) };
             self.runner = ptr::null_mut();
         }
+    }
+}
+
+/// C views of caller-owned input tensors, valid for one infer call.
+///
+/// The bridge ABI lets the bridge only read `input_tensors` while the call runs:
+/// it must not free, keep or modify them. So instead of copying every input into
+/// arrays allocated by the bridge, these structs point straight into the
+/// caller's [`Tensor`] buffers. The pointers are `*mut` only because the C
+/// structs declare them that way.
+///
+/// Only the names are copied, into small NUL-terminated buffers, because the
+/// bridge contract has always handed bridges NUL-terminated names.
+///
+/// Each `Vec` is filled once and never grows afterwards, so the pointers into
+/// their heap buffers stay valid when the struct is moved.
+pub(crate) struct BorrowedInputs<'t> {
+    _names: Vec<Vec<u8>>,
+    _shapes: Vec<RSInferLLArray>,
+    _data: Vec<RSInferUCharArray>,
+    _tensors: Vec<RSInferTensor>,
+    _tensor_ptrs: Vec<*mut RSInferTensor>,
+    array: RSInferTensorArray,
+    _inputs: PhantomData<&'t [Tensor]>,
+}
+
+impl<'t> BorrowedInputs<'t> {
+    pub(crate) fn new(inputs: &'t [Tensor]) -> Self {
+        let names: Vec<Vec<u8>> = inputs
+            .iter()
+            .map(|t| {
+                let mut name = Vec::with_capacity(t.name.len() + 1);
+                name.extend_from_slice(t.name.as_bytes());
+                name.push(0);
+                name
+            })
+            .collect();
+        let mut shapes: Vec<RSInferLLArray> = inputs
+            .iter()
+            .map(|t| RSInferLLArray { data: t.shape.as_ptr().cast::<c_longlong>().cast_mut(), length: t.shape.len() })
+            .collect();
+        let mut data: Vec<RSInferUCharArray> = inputs
+            .iter()
+            .map(|t| RSInferUCharArray { data: t.data.as_ptr().cast_mut(), length: t.data.len() })
+            .collect();
+        let mut tensors: Vec<RSInferTensor> = inputs
+            .iter()
+            .zip(names.iter())
+            .zip(shapes.iter_mut())
+            .zip(data.iter_mut())
+            .map(|(((t, name), shape), data)| RSInferTensor {
+                name: name.as_ptr().cast::<c_char>().cast_mut(),
+                name_length: t.name.len(),
+                dtype: t.dtype as RSInferDataType,
+                data: ptr::from_mut(data),
+                shape: ptr::from_mut(shape),
+            })
+            .collect();
+        let mut tensor_ptrs: Vec<*mut RSInferTensor> = tensors.iter_mut().map(ptr::from_mut).collect();
+        let array = RSInferTensorArray { tensors: tensor_ptrs.as_mut_ptr(), length: tensor_ptrs.len() };
+        BorrowedInputs {
+            _names: names,
+            _shapes: shapes,
+            _data: data,
+            _tensors: tensors,
+            _tensor_ptrs: tensor_ptrs,
+            array,
+            _inputs: PhantomData,
+        }
+    }
+
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut RSInferTensorArray {
+        ptr::from_mut(&mut self.array)
     }
 }
 
@@ -222,93 +299,37 @@ impl InferInstance<'_> {
         tensors.map_err(InferError::from)
     }
 
-    /// Infer function
+    /// Runs inference and waits for it. Fetch the outputs with [`get_results`](Self::get_results).
+    ///
+    /// The bridge reads the input data in place for the duration of the call
+    /// (see [`BorrowedInputs`]); nothing is copied on the Rust side.
     pub fn infer(&self, inputs: &[Tensor]) -> InferResult<()> {
-        // Turn tensors into RSInferTensorArray
-        let rs_infer_tensor_arr_ptr = unsafe { (self.engine.bridge.tensorarray_create)(inputs.len()) };
-        if rs_infer_tensor_arr_ptr.is_null() {
-            return Err(
-                InferError::Backend { message: "tensorarray_create failed.".to_string() }
-            )
-        }
-        let tensors = unsafe { (*rs_infer_tensor_arr_ptr).as_mut_slice() };
-
-        for (raw_t, inp) in tensors.iter_mut().zip(inputs.iter()) {
-            let rs_tensor_ptr = match unsafe { self.rs_tensor_from_tensor(inp) } {
-                Ok(ptr) => ptr,
-                Err(err) => {
-                    unsafe { (self.engine.bridge.tensorarray_destroy)(rs_infer_tensor_arr_ptr) };
-                    return Err(err);
-                }
-            };
-            *raw_t = rs_tensor_ptr;
-        }
-
-        let mut err = RSInferError::default();
-        let ret = unsafe { (self.engine.bridge.runner_infer)(self.runner, rs_infer_tensor_arr_ptr, &mut err) };
-        if ret != 0 {
-            // The C++ side copied everything, so free the inputs whatever rc was.
-            unsafe { (self.engine.bridge.tensorarray_destroy)(rs_infer_tensor_arr_ptr) };
-            return Err(take_error(&mut err, &self.engine.bridge).unwrap_or(InferError::Backend {
-                message: "runner_infer returned an error".to_string(),
-            }));
-        }
-        if err.code != 0 || !err.message.is_null() {
-            // The C++ side copied everything, so free the inputs whatever rc was.
-            unsafe { (self.engine.bridge.tensorarray_destroy)(rs_infer_tensor_arr_ptr) };
-            return Err(take_error(&mut err, &self.engine.bridge).unwrap_or(InferError::Backend {
-                message: "runner_infer returned an error".to_string(),
-            }));
-        }
-
-        // The C++ side copied everything, so free the inputs whatever rc was.
-        unsafe { (self.engine.bridge.tensorarray_destroy)(rs_infer_tensor_arr_ptr) };
-
-        Ok(())
+        let infer = self.engine.bridge.runner_infer;
+        self.call_infer(inputs, "runner_infer", |array, err| unsafe { infer(self.runner, array, err) })
     }
 
-    /// Infer function. Runs asynchronously.
+    /// Queues inference and returns once the bridge has taken a copy of the
+    /// inputs. Fetch the outputs with [`get_results`](Self::get_results), in
+    /// submission order.
     pub fn infer_async(&self, inputs: &[Tensor]) -> InferResult<()> {
-        // Turn tensors into RSInferTensorArray
-        let rs_infer_tensor_arr_ptr = unsafe { (self.engine.bridge.tensorarray_create)(inputs.len()) };
-        if rs_infer_tensor_arr_ptr.is_null() {
-            return Err(
-                InferError::Backend { message: "tensorarray_create failed.".to_string() }
-            )
-        }
-        let tensors = unsafe { (*rs_infer_tensor_arr_ptr).as_mut_slice() };
+        let infer_async = self.engine.bridge.runner_infer_async;
+        self.call_infer(inputs, "runner_infer_async", |array, err| unsafe { infer_async(self.runner, array, err) })
+    }
 
-        for (raw_t, inp) in tensors.iter_mut().zip(inputs.iter()) {
-            let rs_tensor_ptr = match unsafe { self.rs_tensor_from_tensor(inp) } {
-                Ok(ptr) => ptr,
-                Err(err) => {
-                    unsafe { (self.engine.bridge.tensorarray_destroy)(rs_infer_tensor_arr_ptr) };
-                    return Err(err);
-                }
-            };
-            *raw_t = rs_tensor_ptr;
-        }
-
+    fn call_infer(
+        &self,
+        inputs: &[Tensor],
+        name: &str,
+        call: impl FnOnce(*mut RSInferTensorArray, *mut RSInferError) -> c_int,
+    ) -> InferResult<()> {
+        let mut borrowed = BorrowedInputs::new(inputs);
         let mut err = RSInferError::default();
-        let ret = unsafe { (self.engine.bridge.runner_infer_async)(self.runner, rs_infer_tensor_arr_ptr, &mut err) };
-        if ret != 0 {
-            // The C++ side copied everything, so free the inputs whatever rc was.
-            unsafe { (self.engine.bridge.tensorarray_destroy)(rs_infer_tensor_arr_ptr) };
+        let ret = call(borrowed.as_mut_ptr(), &mut err);
+        if ret != 0 || err.code != 0 || !err.message.is_null() {
             return Err(take_error(&mut err, &self.engine.bridge).unwrap_or(InferError::Backend {
-                message: "runner_infer returned an error".to_string(),
+                message: format!("{name} returned an error"),
             }));
         }
-        if err.code != 0 || !err.message.is_null() {
-            // The C++ side copied everything, so free the inputs whatever rc was.
-            unsafe { (self.engine.bridge.tensorarray_destroy)(rs_infer_tensor_arr_ptr) };
-            return Err(take_error(&mut err, &self.engine.bridge).unwrap_or(InferError::Backend {
-                message: "runner_infer returned an error".to_string(),
-            }));
-        }
-
-        // The C++ side copied everything, so free the inputs whatever rc was.
-        unsafe { (self.engine.bridge.tensorarray_destroy)(rs_infer_tensor_arr_ptr) };
-
         Ok(())
     }
 
@@ -326,54 +347,6 @@ impl InferInstance<'_> {
     /// Output shape of the engine, in row-major order. Dynamic dimensions are `-1`.
     pub fn output_shape(&self, order: u32) -> InferResult<Shape> {
         Ok(self.output_info(order)?.shape)
-    }
-
-    /// Creates an RSInferTensor from rust's implementation of Tensor
-    /// You must manually delete this object by calling the bridge's tensorarray_destroy
-    unsafe fn rs_tensor_from_tensor(&self, tensor: &Tensor) -> InferResult<*mut RSInferTensor> {
-        // Convert name to c_str
-        let name_cstr = tensor.name.as_ptr() as *const c_char;
-        let name_len = tensor.name.len();
-        // Convert dtype to c equivalent
-        let dtype_c = tensor.dtype as c_int;
-        // Convert shape to c equivalent
-        let shape_len = tensor.shape.len();
-        let rs_ll_arr_ptr = unsafe { (self.engine.bridge.llarray_create)(shape_len) };
-        if rs_ll_arr_ptr.is_null() {
-            return Err(InferError::Backend { message: "llarray_create returned null".to_string() })
-        }
-
-        // populate the llarray
-        let ll_slice = unsafe { (*rs_ll_arr_ptr).as_mut_slice() };
-        for (item, dim) in ll_slice.iter_mut().zip(tensor.shape.iter()) {
-            *item = *dim;
-        }
-
-        // Convert data to c_data
-        let data_len = tensor.data.len();
-        let data_ptr = unsafe { (self.engine.bridge.uchararray_create)(data_len) };
-        if data_ptr.is_null() {
-            unsafe {
-                (self.engine.bridge.llarray_destroy)(rs_ll_arr_ptr);
-            }
-            return Err(InferError::Backend { message: "uchararray_create returned null".to_string() })
-        }
-        // Populate data
-        let data_slice = unsafe { (*data_ptr).as_mut_slice() };
-        for (item, dat) in data_slice.iter_mut().zip(tensor.data.iter()) {
-            *item = dat.clone();
-        }
-        // Create tensor array
-        let rs_tensor_ptr = unsafe { (self.engine.bridge.tensor_create)(name_cstr, name_len, dtype_c as _, data_ptr, rs_ll_arr_ptr) };
-        if rs_tensor_ptr.is_null() {
-            unsafe {
-                (self.engine.bridge.llarray_destroy)(rs_ll_arr_ptr);
-                (self.engine.bridge.uchararray_destroy)(data_ptr);
-            }
-            return Err(InferError::Backend { message: "tensor_create returned null".to_string() })
-        }
-
-        Ok(rs_tensor_ptr)
     }
 
     /// Path of the model file.
@@ -547,6 +520,33 @@ mod tests {
     fn empty_tensor_array_may_have_null_list() {
         let empty = RSInferTensorArray { tensors: ptr::null_mut(), length: 0 };
         assert!(unsafe { tensors_from_array(&empty, "runner_get_results") }.unwrap().is_empty());
+    }
+
+    #[test]
+    fn borrowed_inputs_point_into_caller_tensors() {
+        let inputs = vec![
+            Tensor { name: "input".into(), shape: vec![1, 3, 2, 2], dtype: Dtype::F32, data: vec![7; 48] },
+            Tensor { name: "mask".into(), shape: vec![], dtype: Dtype::U8, data: vec![] },
+        ];
+        let mut borrowed = BorrowedInputs::new(&inputs);
+        // Moving the struct must not invalidate the pointers into its vectors.
+        let mut moved = std::mem::replace(&mut borrowed, BorrowedInputs::new(&[]));
+        let array = unsafe { &*moved.as_mut_ptr() };
+        assert_eq!(array.length, 2);
+        for (i, input) in inputs.iter().enumerate() {
+            let tensor = unsafe { &**array.tensors.add(i) };
+            let name = unsafe { CStr::from_ptr(tensor.name) };
+            assert_eq!(name.to_bytes(), input.name.as_bytes());
+            assert_eq!(tensor.name_length, input.name.len());
+            assert_eq!(tensor.dtype, input.dtype as RSInferDataType);
+            let (shape, data) = unsafe { (&*tensor.shape, &*tensor.data) };
+            // No copies: the views alias the caller's buffers.
+            assert_eq!(shape.data.cast_const().cast::<i64>(), input.shape.as_ptr());
+            assert_eq!(shape.length, input.shape.len());
+            assert_eq!(data.data.cast_const(), input.data.as_ptr());
+            assert_eq!(data.length, input.data.len());
+        }
+        assert_eq!(unsafe { (*borrowed.as_mut_ptr()).length }, 0);
     }
 
     #[test]
