@@ -39,6 +39,41 @@ pub struct Tensor {
     pub data: Vec<u8>, // Placeholder for actual tensor data
 }
 
+/// Description of a model input or output, as reported by the backend.
+///
+/// Dynamic dimensions are `-1`, and an empty shape means even the rank is
+/// unknown. Send fully concrete shapes when you infer.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
+pub struct TensorInfo {
+    pub name: String,
+    pub shape: Shape,
+    pub dtype: Dtype,
+}
+
+impl TensorInfo {
+    /// Whether the shape is not fully known: some dimension is dynamic
+    /// (negative), or the shape is empty.
+    ///
+    /// An empty shape counts as dynamic because the bridges use it for a tensor
+    /// whose rank is unknown. A genuine rank-0 scalar also has an empty shape,
+    /// so it is reported as dynamic too: the C ABI cannot tell the two apart.
+    pub fn is_dynamic(&self) -> bool {
+        self.shape.is_empty() || self.shape.iter().any(|&dim| dim < 0)
+    }
+
+    /// Whether the number of dimensions is unknown (reported as an empty shape).
+    /// Also true for a rank-0 scalar, which the C ABI cannot distinguish.
+    pub fn is_rank_unknown(&self) -> bool {
+        self.shape.is_empty()
+    }
+}
+
+impl From<Tensor> for TensorInfo {
+    fn from(tensor: Tensor) -> Self {
+        TensorInfo { name: tensor.name, shape: tensor.shape, dtype: tensor.dtype }
+    }
+}
+
 impl Dtype {
     pub fn from_c_int(value: i32) -> Self {
         match value {
@@ -215,6 +250,17 @@ mod tests {
         assert_eq!(Dtype::F8E5M2.byte_size(), 1);
         assert_eq!(Dtype::I4.byte_size(), 1);
         assert_eq!(Dtype::UNKNOWN.byte_size(), 0);
+    }
+
+    #[test]
+    fn unknown_rank_and_negative_dims_are_dynamic() {
+        use super::TensorInfo;
+        let info = |shape: Vec<i64>| TensorInfo { name: "t".to_string(), shape, dtype: Dtype::F32 };
+        assert!(!info(vec![1, 3, 480, 640]).is_dynamic());
+        assert!(info(vec![-1, 3, 480, 640]).is_dynamic());
+        assert!(info(vec![]).is_dynamic());
+        assert!(info(vec![]).is_rank_unknown());
+        assert!(!info(vec![-1]).is_rank_unknown());
     }
 
     #[test]

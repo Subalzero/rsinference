@@ -45,6 +45,23 @@ TEST(LLArray, CreateZeroLengthIsUsable)
     rs_infer_llarray_destroy(array);
 }
 
+TEST(ZeroLengthArrays, HaveNullDataAndAreDestroyable)
+{
+    // Zero-length arrays never call malloc(0), so they cannot fail on an
+    // allocator that returns NULL for it; data is NULL by contract.
+    RSInferUCharArray* bytes = rs_infer_uchararray_create(0);
+    ASSERT_NE(bytes, nullptr);
+    EXPECT_EQ(bytes->length, 0U);
+    EXPECT_EQ(bytes->data, nullptr);
+    rs_infer_uchararray_destroy(bytes);
+
+    RSInferTensorArray* tensors = rs_infer_tensorarray_create(0);
+    ASSERT_NE(tensors, nullptr);
+    EXPECT_EQ(tensors->length, 0U);
+    EXPECT_EQ(tensors->tensors, nullptr);
+    rs_infer_tensorarray_destroy(tensors);
+}
+
 TEST(LLArray, DestroyNullIsNoOp)
 {
     rs_infer_llarray_destroy(nullptr);
@@ -259,31 +276,17 @@ TEST(RunnerEntryPoints, NullRunnerIsRejected)
     rs_infer_error_cleanmsg(&error);
 
     error = RSInferError{};
-    EXPECT_EQ(rs_inference_runner_get_input_shape(nullptr, 0, &error), nullptr);
+    EXPECT_EQ(rs_inference_runner_get_input_tensors_info(nullptr, &error), nullptr);
     EXPECT_EQ(error.code, kInvalidArguments);
     rs_infer_error_cleanmsg(&error);
 
     error = RSInferError{};
-    EXPECT_EQ(rs_inference_runner_get_output_shape(nullptr, 0, &error), nullptr);
+    EXPECT_EQ(rs_inference_runner_get_output_tensors_info(nullptr, &error), nullptr);
     EXPECT_EQ(error.code, kInvalidArguments);
     rs_infer_error_cleanmsg(&error);
 
     error = RSInferError{};
-    EXPECT_EQ(rs_inference_runner_get_tensor_data_type(nullptr, "input", &error),
-              RSInferDataType_Unknown);
-    EXPECT_EQ(error.code, kInvalidArguments);
-    rs_infer_error_cleanmsg(&error);
-
-    EXPECT_EQ(rs_inference_runner_get_tensor_data_size(nullptr, RSInferDataType_Float32, &error), 0U);
-    EXPECT_EQ(rs_inference_runner_get_input_tensor_name(nullptr, 0, &error), nullptr);
-    EXPECT_EQ(rs_inference_runner_get_output_tensor_name(nullptr, 0, &error), nullptr);
-}
-
-TEST(RunnerEntryPoints, NullTensorNameIsRejected)
-{
-    RSInferError error{};
-    EXPECT_EQ(rs_inference_runner_get_tensor_data_type(nullptr, nullptr, &error),
-              RSInferDataType_Unknown);
+    EXPECT_EQ(rs_inference_runner_get_json_config(nullptr, &error), nullptr);
     EXPECT_EQ(error.code, kInvalidArguments);
     rs_infer_error_cleanmsg(&error);
 }
@@ -332,12 +335,9 @@ TEST(DynamicLoad, AllHeaderExportsPresentInDll)
         "rs_inference_runner_infer",
         "rs_inference_runner_infer_async",
         "rs_inference_runner_get_results",
-        "rs_inference_runner_get_input_shape",
-        "rs_inference_runner_get_output_shape",
-        "rs_inference_runner_get_tensor_data_type",
-        "rs_inference_runner_get_tensor_data_size",
-        "rs_inference_runner_get_input_tensor_name",
-        "rs_inference_runner_get_output_tensor_name",
+        "rs_inference_runner_get_input_tensors_info",
+        "rs_inference_runner_get_output_tensors_info",
+        "rs_inference_runner_get_json_config",
     };
     constexpr int kCount = sizeof(expected) / sizeof(expected[0]);
 

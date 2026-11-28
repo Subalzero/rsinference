@@ -187,8 +187,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 `create_infer_instance` accepts an optional backend JSON configuration string.
-`InferInstance` also provides `tensor_dtype`, synchronous `infer`,
-`infer_async`, and `get_results`. Inputs and outputs use the public
+`InferInstance` also provides `inputs_info` and `outputs_info` (name, shape
+and dtype of every model input/output as `TensorInfo`), `tensor_dtype`,
+`json_config` (the runner's effective configuration, reusable as
+`create_infer_instance`'s config), synchronous `infer`, `infer_async`, and
+`get_results`. Inputs and outputs use the public
 `rsinference::types::Tensor` and `Dtype` types. For a complete working example
 that preprocesses images and consumes inference results, see
 [`examples/facedetection`](examples/facedetection/README.md).
@@ -203,7 +206,7 @@ to the current executable, then asks the platform loader to resolve the bare
 library name (typically through `PATH`). You can also load a library by path
 with `Bridge::load(path)` or by name with `Bridge::load_backend(name)`.
 The public header `cpp/include/public/rsinference.h` is C-compatible and exports
-`rs_inference_abi_version()`. The Rust loader checks ABI version 1 before
+`rs_inference_abi_version()`. The Rust loader checks ABI version 3 before
 resolving the remaining bridge functions.
 
 TensorRT's and OpenVINO's own DLLs/shared libraries must also be discoverable

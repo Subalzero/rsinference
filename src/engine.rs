@@ -1,16 +1,17 @@
 //! Engine handling shared by all backends.
 
+use std::cell::OnceCell;
 use std::ffi::{CStr, CString, c_int};
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
 use crate::dll::take_error;
-use crate::error::{EngineError, EngineResult, InferError, InferResult};
-use crate::ffi::{RSInferError, RSInferTensor, RSInferenceRunner};
+use crate::error::{DataResult, EngineError, EngineResult, InferError, InferResult};
+use crate::ffi::{RSInferError, RSInferTensor, RSInferTensorArray, RSInferenceRunner};
 use crate::Bridge;
 use crate::types::*;
-use std::os::raw::{c_char, c_uint};
+use std::os::raw::c_char;
 
 /// Inference backend an [`Engine`] talks to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +73,10 @@ pub struct InferInstance<'a> {
     runner: *mut RSInferenceRunner,
     engine: &'a Engine,
     model_path: PathBuf,
+    /// A built runner's inputs and outputs never change, so each list is
+    /// fetched from the bridge once, on first use.
+    inputs: OnceCell<Vec<TensorInfo>>,
+    outputs: OnceCell<Vec<TensorInfo>>,
 }
 
 // Identity is the runner pointer only. Deriving would require Bridge: PartialEq/Eq.
@@ -100,80 +105,121 @@ impl Drop for InferInstance<'_> {
 }
 
 impl InferInstance<'_> {
-    /// Name of the input tensor, as expected by the engine.
-    pub fn input_name(&self, order: u32) -> Result<String, InferError> {
-        let mut err: RSInferError = RSInferError::default();
-        let name_ptr = unsafe { (self.engine.bridge.runner_get_input_tensor_name)(self.runner, order as c_uint, &mut err) };
+    /// Name, shape and data type of every model input, in model order.
+    /// Dynamic dimensions are `-1`; an empty shape means even the rank is unknown.
+    pub fn inputs_info(&self) -> InferResult<Vec<TensorInfo>> {
+        self.cached_inputs().map(<[TensorInfo]>::to_vec)
+    }
 
-        if name_ptr.is_null() {
+    /// Name, shape and data type of every model output, in model order.
+    /// Dynamic dimensions are `-1`; an empty shape means even the rank is unknown.
+    pub fn outputs_info(&self) -> InferResult<Vec<TensorInfo>> {
+        self.cached_outputs().map(<[TensorInfo]>::to_vec)
+    }
+
+    fn cached_inputs(&self) -> InferResult<&[TensorInfo]> {
+        self.cached(&self.inputs, self.engine.bridge.runner_get_input_tensors_info, "runner_get_input_tensors_info")
+    }
+
+    fn cached_outputs(&self) -> InferResult<&[TensorInfo]> {
+        self.cached(&self.outputs, self.engine.bridge.runner_get_output_tensors_info, "runner_get_output_tensors_info")
+    }
+
+    /// Returns `cell`'s list, fetching it through `fetch` the first time.
+    /// A failed fetch is not cached, so a later call retries.
+    fn cached<'s>(
+        &self,
+        cell: &'s OnceCell<Vec<TensorInfo>>,
+        fetch: crate::dll::FnRunnerGetTensorsInfo,
+        call: &str,
+    ) -> InferResult<&'s [TensorInfo]> {
+        if let Some(infos) = cell.get() {
+            return Ok(infos);
+        }
+        let mut err = RSInferError::default();
+        let ptr = unsafe { fetch(self.runner, &mut err) };
+        let infos = self
+            .take_tensor_array(ptr, &mut err, call)?
+            .into_iter()
+            .map(TensorInfo::from)
+            .collect();
+        Ok(cell.get_or_init(|| infos))
+    }
+
+    /// The runner's effective configuration as a JSON string. It uses the same
+    /// keys as the `json_config` passed to [`Engine::create_infer_instance`], so
+    /// it can be passed back to create an equivalent instance.
+    pub fn json_config(&self) -> InferResult<String> {
+        let mut err = RSInferError::default();
+        let ptr = unsafe { (self.engine.bridge.runner_get_json_config)(self.runner, &mut err) };
+        if ptr.is_null() {
             return Err(take_error(&mut err, &self.engine.bridge).unwrap_or(InferError::Backend {
-                message: "runner_get_input_name returned null".to_string(),
+                message: "runner_get_json_config returned null".to_string(),
             }));
         }
-
-        if err.code != 0 || !err.message.is_null() {
-            let error = take_error(&mut err, &self.engine.bridge).unwrap_or(InferError::Backend {
-                message: "runner_get_input_name returned an error".to_string(),
-            });
+        let config = unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned();
+        // The bridge allocated this; free it with the bridge's C runtime.
+        unsafe { (self.engine.bridge.string_free)(ptr) };
+        if let Some(error) = take_error(&mut err, &self.engine.bridge) {
             return Err(error);
         }
+        Ok(config)
+    }
 
-        let name = unsafe { CStr::from_ptr(name_ptr) }
-            .to_string_lossy()
-            .into_owned();
+    /// Info of the input at `order`.
+    pub fn input_info(&self, order: u32) -> InferResult<TensorInfo> {
+        nth_info(self.cached_inputs()?, order, "input").cloned()
+    }
 
-        // The C++ side allocated this; release it with the bridge so the
-        // matching C runtime performs the free.
-        unsafe { (self.engine.bridge.string_free)(name_ptr) };
+    /// Info of the output at `order`.
+    pub fn output_info(&self, order: u32) -> InferResult<TensorInfo> {
+        nth_info(self.cached_outputs()?, order, "output").cloned()
+    }
 
-        Ok(name)
+    /// Name of the input tensor, as expected by the engine.
+    pub fn input_name(&self, order: u32) -> InferResult<String> {
+        Ok(self.input_info(order)?.name)
     }
 
     /// Name of the output tensor, as expected by the engine.
-    pub fn output_name(&self, order: u32) -> Result<String, InferError> {
-        let mut err: RSInferError = RSInferError::default();
-        let name_ptr = unsafe { (self.engine.bridge.runner_get_output_tensor_name)(self.runner, order as c_uint, &mut err) };
+    pub fn output_name(&self, order: u32) -> InferResult<String> {
+        Ok(self.output_info(order)?.name)
+    }
 
-        if name_ptr.is_null() {
-            return Err(take_error(&mut err, &self.engine.bridge).unwrap_or(InferError::Backend {
-                message: "runner_get_output_name returned null".to_string(),
+    /// Data type of the input or output tensor called `name`.
+    pub fn tensor_dtype(&self, name: &str) -> InferResult<Dtype> {
+        self.cached_inputs()?
+            .iter()
+            .chain(self.cached_outputs()?)
+            .find(|info| info.name == name)
+            .map(|info| info.dtype)
+            .ok_or_else(|| InferError::Backend { message: format!("no tensor named {name:?}") })
+    }
+
+    /// Converts a bridge-allocated tensor array to Rust and frees it. Handles the
+    /// null-on-error and error-alongside-result cases of every array-returning call.
+    fn take_tensor_array(
+        &self,
+        ptr: *mut RSInferTensorArray,
+        err: &mut RSInferError,
+        call: &str,
+    ) -> InferResult<Vec<Tensor>> {
+        let bridge = &self.engine.bridge;
+        if ptr.is_null() {
+            return Err(take_error(err, bridge).unwrap_or(InferError::Backend {
+                message: format!("{call} returned null"),
             }));
         }
-
-        if err.code != 0 || !err.message.is_null() {
-            let error = take_error(&mut err, &self.engine.bridge).unwrap_or(InferError::Backend {
-                message: "runner_get_output_name returned an error".to_string(),
-            });
+        if let Some(error) = take_error(err, bridge) {
+            unsafe { (bridge.tensorarray_destroy)(ptr) };
             return Err(error);
         }
 
-        let name = unsafe { CStr::from_ptr(name_ptr) }
-            .to_string_lossy()
-            .into_owned();
+        let tensors = unsafe { tensors_from_array(&*ptr, call) };
 
-        // The C++ side allocated this; release it with the bridge so the
-        // matching C runtime performs the free.
-        unsafe { (self.engine.bridge.string_free)(name_ptr) };
-
-        Ok(name)
-    }
-
-    /// Data type of a tensor, as expected by the engine specified by name.
-    pub fn tensor_dtype(&self, name: &str) -> Result<Dtype, InferError> {
-        let name_c = CString::new(name).map_err(|_| InferError::Backend {
-            message: "tensor name contains an interior NUL".to_string(),
-        })?;
-
-        let mut err: RSInferError = RSInferError::default();
-        let dtype = unsafe { (self.engine.bridge.runner_get_tensor_data_type)(self.runner, name_c.as_ptr(), &mut err) };
-
-        if err.code != 0 || !err.message.is_null() {
-            return Err(take_error(&mut err, &self.engine.bridge).unwrap_or(InferError::Backend {
-                message: "runner_get_input_tensor_dtype returned an error".to_string(),
-            }));
-        }
-
-        Ok(Dtype::from_c_int(dtype as i32))
+        // Release the array even if a tensor fails conversion.
+        unsafe { (bridge.tensorarray_destroy)(ptr) };
+        tensors.map_err(InferError::from)
     }
 
     /// Infer function
@@ -185,7 +231,7 @@ impl InferInstance<'_> {
                 InferError::Backend { message: "tensorarray_create failed.".to_string() }
             )
         }
-        let tensors = unsafe { std::slice::from_raw_parts_mut((*rs_infer_tensor_arr_ptr).tensors, (*rs_infer_tensor_arr_ptr).length) };
+        let tensors = unsafe { (*rs_infer_tensor_arr_ptr).as_mut_slice() };
 
         for (raw_t, inp) in tensors.iter_mut().zip(inputs.iter()) {
             let rs_tensor_ptr = match unsafe { self.rs_tensor_from_tensor(inp) } {
@@ -230,7 +276,7 @@ impl InferInstance<'_> {
                 InferError::Backend { message: "tensorarray_create failed.".to_string() }
             )
         }
-        let tensors = unsafe { std::slice::from_raw_parts_mut((*rs_infer_tensor_arr_ptr).tensors, (*rs_infer_tensor_arr_ptr).length) };
+        let tensors = unsafe { (*rs_infer_tensor_arr_ptr).as_mut_slice() };
 
         for (raw_t, inp) in tensors.iter_mut().zip(inputs.iter()) {
             let rs_tensor_ptr = match unsafe { self.rs_tensor_from_tensor(inp) } {
@@ -268,94 +314,18 @@ impl InferInstance<'_> {
 
     pub fn get_results(&self) -> InferResult<Vec<Tensor>> {
         let mut err = RSInferError::default();
-        let rs_infer_tensor_arr_ptr = unsafe { (self.engine.bridge.runner_get_results)(self.runner, &mut err) };
-        if rs_infer_tensor_arr_ptr.is_null() {
-            return Err(take_error(&mut err, &self.engine.bridge).unwrap_or(InferError::Backend {
-                message: "runner_get_results returned null".to_string(),
-            }));
-        }
-        if err.code != 0 || !err.message.is_null() {
-            // The C++ side copied everything, so free the inputs whatever rc was.
-            unsafe { (self.engine.bridge.tensorarray_destroy)(rs_infer_tensor_arr_ptr) };
-            return Err(take_error(&mut err, &self.engine.bridge).unwrap_or(InferError::Backend {
-                message: "runner_get_results returned an error".to_string(),
-            }));
-        }
-
-        let tensors_result = unsafe { std::slice::from_raw_parts((*rs_infer_tensor_arr_ptr).tensors, (*rs_infer_tensor_arr_ptr).length) }
-            .iter()
-            .map(|&t| unsafe { Tensor::from_rs_infer_tensor_ptr(&t) })
-            .collect::<Result<Vec<_>, _>>();
-
-        // The bridge allocated the result array; release it even if a tensor
-        // fails conversion.
-        unsafe { (self.engine.bridge.tensorarray_destroy)(rs_infer_tensor_arr_ptr) };
-
-        tensors_result.map_err(InferError::from)
+        let ptr = unsafe { (self.engine.bridge.runner_get_results)(self.runner, &mut err) };
+        self.take_tensor_array(ptr, &mut err, "runner_get_results")
     }
 
-    /// Input shape of the engine, in row-major order.
-    pub fn input_shape(&self, order: u32) -> Result<Shape, InferError> {
-        let mut err: RSInferError = RSInferError::default();
-        let shape_ptr = unsafe { (self.engine.bridge.runner_get_input_shape)(self.runner, order as c_uint, &mut err) };
-
-        if shape_ptr.is_null() {
-            return Err(take_error(&mut err, &self.engine.bridge).unwrap_or(InferError::Backend {
-                message: "runner_get_input_shape returned null".to_string(),
-            }));
-        }
-
-        if err.code != 0 || !err.message.is_null() {
-            let error = take_error(&mut err, &self.engine.bridge).unwrap_or(InferError::Backend {
-                message: "runner_get_input_shape returned an error".to_string(),
-            });
-            return Err(error);
-        }
-
-        let shape_result = unsafe { from_rs_infer_int_array_ptr(&shape_ptr) };
-
-        // The C++ side allocated this with rs_infer_intarray_create; free it
-        // whether or not the conversion succeeded.
-        unsafe { (self.engine.bridge.intarray_destroy)(shape_ptr) };
-
-        let shape: Shape = shape_result.map_err(|e| InferError::ShapeMismatch {
-            expected: "valid shape".to_string(),
-            actual: format!("invalid shape from bridge: {}", e),
-        })?;
-
-        Ok(shape)
+    /// Input shape of the engine, in row-major order. Dynamic dimensions are `-1`.
+    pub fn input_shape(&self, order: u32) -> InferResult<Shape> {
+        Ok(self.input_info(order)?.shape)
     }
 
-    /// Output shape of the engine, in row-major order.
-    pub fn output_shape(&self, order: u32) -> Result<Shape, InferError> {
-        let mut err: RSInferError = RSInferError::default();
-        let shape_ptr = unsafe { (self.engine.bridge.runner_get_output_shape)(self.runner, order as c_uint, &mut err) };
-
-        if shape_ptr.is_null() {
-            return Err(take_error(&mut err, &self.engine.bridge).unwrap_or(InferError::Backend {
-                message: "runner_get_output_shape returned null".to_string(),
-            }));
-        }
-
-        if err.code != 0 || !err.message.is_null() {
-            let error = take_error(&mut err, &self.engine.bridge).unwrap_or(InferError::Backend {
-                message: "runner_get_output_shape returned an error".to_string(),
-            });
-            return Err(error);
-        }
-
-        let shape_result = unsafe { from_rs_infer_int_array_ptr(&shape_ptr) };
-
-        // The C++ side allocated this with rs_infer_intarray_create; free it
-        // whether or not the conversion succeeded.
-        unsafe { (self.engine.bridge.intarray_destroy)(shape_ptr) };
-
-        let shape: Shape = shape_result.map_err(|e| InferError::ShapeMismatch {
-            expected: "valid shape".to_string(),
-            actual: format!("invalid shape from bridge: {}", e),
-        })?;
-
-        Ok(shape)
+    /// Output shape of the engine, in row-major order. Dynamic dimensions are `-1`.
+    pub fn output_shape(&self, order: u32) -> InferResult<Shape> {
+        Ok(self.output_info(order)?.shape)
     }
 
     /// Creates an RSInferTensor from rust's implementation of Tensor
@@ -374,7 +344,7 @@ impl InferInstance<'_> {
         }
 
         // populate the llarray
-        let ll_slice = unsafe { std::slice::from_raw_parts_mut((*rs_ll_arr_ptr).data, shape_len) };
+        let ll_slice = unsafe { (*rs_ll_arr_ptr).as_mut_slice() };
         for (item, dim) in ll_slice.iter_mut().zip(tensor.shape.iter()) {
             *item = *dim;
         }
@@ -389,7 +359,7 @@ impl InferInstance<'_> {
             return Err(InferError::Backend { message: "uchararray_create returned null".to_string() })
         }
         // Populate data
-        let data_slice = unsafe { std::slice::from_raw_parts_mut((*data_ptr).data, data_len) };
+        let data_slice = unsafe { (*data_ptr).as_mut_slice() };
         for (item, dat) in data_slice.iter_mut().zip(tensor.data.iter()) {
             *item = dat.clone();
         }
@@ -416,6 +386,29 @@ impl InferInstance<'_> {
         self.engine.engine_type
     }
 
+}
+
+/// Copies every tensor out of a bridge-owned array. A zero-length array may have
+/// a NULL tensor list; a non-zero length with a NULL list is malformed.
+unsafe fn tensors_from_array(array: &RSInferTensorArray, call: &str) -> DataResult<Vec<Tensor>> {
+    if array.length > 0 && array.tensors.is_null() {
+        return Err(crate::error::DataError::InvalidStructure {
+            datatype: "tensor array".to_string(),
+            message: format!("{call} returned {} tensors but a null tensor list", array.length),
+        });
+    }
+    array
+        .as_slice()
+        .iter()
+        .map(|t| Tensor::from_rs_infer_tensor_ptr(t))
+        .collect()
+}
+
+fn nth_info<'i>(infos: &'i [TensorInfo], order: u32, kind: &str) -> InferResult<&'i TensorInfo> {
+    let count = infos.len();
+    infos.get(order as usize).ok_or_else(|| InferError::Backend {
+        message: format!("{kind} index {order} is out of range; the model has {count} {kind}(s)"),
+    })
 }
 
 impl Engine {
@@ -500,6 +493,8 @@ impl Engine {
             runner: runner,
             engine: self,
             model_path: model_path.clone(),
+            inputs: OnceCell::new(),
+            outputs: OnceCell::new(),
         })
     }
 
@@ -539,6 +534,19 @@ mod tests {
             let err = engine.create_infer_instance(&PathBuf::from("nonexistent.engine"), None).unwrap_err();
             assert!(matches!(err, EngineError::Load { .. }));
         }
+    }
+
+    #[test]
+    fn tensor_array_with_null_list_is_rejected() {
+        let malformed = RSInferTensorArray { tensors: ptr::null_mut(), length: 2 };
+        let err = unsafe { tensors_from_array(&malformed, "runner_get_results") }.unwrap_err();
+        assert!(err.to_string().contains("2 tensors but a null tensor list"), "{err}");
+    }
+
+    #[test]
+    fn empty_tensor_array_may_have_null_list() {
+        let empty = RSInferTensorArray { tensors: ptr::null_mut(), length: 0 };
+        assert!(unsafe { tensors_from_array(&empty, "runner_get_results") }.unwrap().is_empty());
     }
 
     #[test]
@@ -674,6 +682,96 @@ mod tests {
 
             assert!(instance.input_name(1).is_err());
             assert!(instance.output_shape(2).is_err());
+        }
+    }
+
+    /// Checks `inputs_info`/`outputs_info` against the sample model.
+    fn assert_sample_info(instance: &InferInstance<'_>) {
+        assert_eq!(instance.inputs_info().unwrap(), vec![TensorInfo {
+            name: "input".to_string(),
+            shape: vec![1, 3, 480, 640],
+            dtype: Dtype::F32,
+        }]);
+        let mut outputs = instance.outputs_info().unwrap();
+        outputs.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(outputs, vec![
+            TensorInfo { name: "boxes".to_string(), shape: vec![1, 17640, 4], dtype: Dtype::F32 },
+            TensorInfo { name: "scores".to_string(), shape: vec![1, 17640, 2], dtype: Dtype::F32 },
+        ]);
+        assert!(instance.tensor_dtype("nope").is_err());
+    }
+
+    hardware_test! {
+        fn openvino_reports_tensors_info() {
+            let Some(engine) = openvino_engine() else { return };
+            let instance = engine.create_infer_instance(&sample_model(), OPENVINO_CPU).unwrap();
+            assert_sample_info(&instance);
+        }
+    }
+
+    hardware_test! {
+        fn openvino_json_config_round_trips() {
+            let Some(engine) = openvino_engine() else { return };
+            let instance = engine.create_infer_instance(&sample_model(), OPENVINO_CPU).unwrap();
+            let config = instance.json_config().unwrap();
+            // The bridge emits compact JSON (nlohmann `dump()` without indent).
+            assert!(config.contains(r#""device":"CPU""#), "{config}");
+            // The reported config is accepted back by create.
+            let again = engine.create_infer_instance(&sample_model(), Some(&config)).unwrap();
+            assert_eq!(again.json_config().unwrap(), config);
+        }
+    }
+
+    hardware_test! {
+        fn tensorrt_reports_tensors_info() {
+            let Some(engine) = tensorrt_engine() else { return };
+            let instance = engine.create_infer_instance(&sample_model(), None).unwrap();
+            assert_sample_info(&instance);
+        }
+    }
+
+    hardware_test! {
+        fn tensorrt_input_tensor_names_are_used_and_checked() {
+            let Some(engine) = tensorrt_engine() else { return };
+            let config = r#"{"input_tensor_names": ["input"], "output_tensor_names": ["scores", "boxes"]}"#;
+            let instance = engine.create_infer_instance(&sample_model(), Some(config)).unwrap();
+            assert_sample_info(&instance);
+            let names: Vec<_> = instance.outputs_info().unwrap().into_iter().map(|i| i.name).collect();
+            assert_eq!(names, ["scores", "boxes"], "outputs follow output_tensor_names order");
+
+            // A name the engine does not have is rejected when the runner is created.
+            let err = engine.create_infer_instance(&sample_model(), Some(r#"{"input_tensor_names": ["imput"]}"#));
+            assert!(matches!(err, Err(EngineError::Engine { .. })), "{err:?}");
+        }
+    }
+
+    hardware_test! {
+        fn tensorrt_profile_gets_its_own_engine_cache() {
+            let Some(engine) = tensorrt_engine() else { return };
+            // The sample input is static, so the only valid range is its own shape.
+            let config = r#"{"profile": {"input": {"min": [1,3,480,640], "opt": [1,3,480,640], "max": [1,3,480,640]}}}"#;
+            let instance = engine.create_infer_instance(&sample_model(), Some(config)).unwrap();
+            instance.infer(&[sample_input()]).unwrap();
+            assert_sample_outputs(&instance.get_results().unwrap());
+
+            let models = sample_model().parent().unwrap().to_path_buf();
+            let cached: Vec<_> = std::fs::read_dir(&models).unwrap()
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|n| n.starts_with("version-RFB-640.dynamic-") && n.ends_with(".engine"))
+                .collect();
+            assert!(!cached.is_empty(), "no profile-keyed engine cache in {}", models.display());
+        }
+    }
+
+    hardware_test! {
+        fn tensorrt_json_config_round_trips() {
+            let Some(engine) = tensorrt_engine() else { return };
+            let instance = engine.create_infer_instance(&sample_model(), Some(r#"{"n_contexts": 2}"#)).unwrap();
+            let config = instance.json_config().unwrap();
+            // The bridge emits compact JSON (nlohmann `dump()` without indent).
+            assert!(config.contains(r#""n_contexts":2"#), "{config}");
+            let again = engine.create_infer_instance(&sample_model(), Some(&config)).unwrap();
+            assert_eq!(again.json_config().unwrap(), config);
         }
     }
 

@@ -14,8 +14,10 @@ RSInferLLArray* rs_infer_llarray_create(size_t length)
     if (!array) {
         return NULL;
     }
-    array->data = (long long*)malloc(length * sizeof(long long));
-    if (!array->data) {
+    // A zero-length array has data == NULL: malloc(0) may legitimately return
+    // NULL, which must not be mistaken for an allocation failure.
+    array->data = length ? (long long*)malloc(length * sizeof(long long)) : NULL;
+    if (length && !array->data) {
         free(array);
         return NULL;
     }
@@ -37,8 +39,10 @@ RSInferFPArray* rs_infer_fparray_create(size_t length)
     if (!array) {
         return NULL;
     }
-    array->data = (float*)malloc(length * sizeof(float));
-    if (!array->data) {
+    // A zero-length array has data == NULL: malloc(0) may legitimately return
+    // NULL, which must not be mistaken for an allocation failure.
+    array->data = length ? (float*)malloc(length * sizeof(float)) : NULL;
+    if (length && !array->data) {
         free(array);
         return NULL;
     }
@@ -60,8 +64,10 @@ RSInferUCharArray* rs_infer_uchararray_create(size_t length)
     if (!array) {
         return NULL;
     }
-    array->data = (unsigned char*)malloc(length * sizeof(unsigned char));
-    if (!array->data) {
+    // A zero-length array has data == NULL: malloc(0) may legitimately return
+    // NULL, which must not be mistaken for an allocation failure.
+    array->data = length ? (unsigned char*)malloc(length * sizeof(unsigned char)) : NULL;
+    if (length && !array->data) {
         free(array);
         return NULL;
     }
@@ -83,8 +89,10 @@ RSInferIntArray* rs_infer_intarray_create(size_t length)
     if (!array) {
         return NULL;
     }
-    array->data = (int*)malloc(length * sizeof(int));
-    if (!array->data) {
+    // A zero-length array has data == NULL: malloc(0) may legitimately return
+    // NULL, which must not be mistaken for an allocation failure.
+    array->data = length ? (int*)malloc(length * sizeof(int)) : NULL;
+    if (length && !array->data) {
         free(array);
         return NULL;
     }
@@ -159,8 +167,8 @@ RSInferTensorArray* rs_infer_tensorarray_create(size_t length)
     }
     // Zeroed so that a partially filled array is still safe to destroy:
     // `rs_infer_tensorarray_destroy` walks every slot.
-    array->tensors = (RSInferTensor**)calloc(length, sizeof(RSInferTensor*));
-    if (!array->tensors) {
+    array->tensors = length ? (RSInferTensor**)calloc(length, sizeof(RSInferTensor*)) : NULL;
+    if (length && !array->tensors) {
         free(array);
         return NULL;
     }
