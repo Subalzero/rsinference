@@ -278,11 +278,14 @@ namespace
         return internal;
     }
 
-    std::vector<rsinfer::Tensor> make_inputs(const RSInferTensorArray* input_tensors)
+    //! Views of the caller's input tensors: no data is copied here. The runner
+    //! reads them in place (process) or copies them once into its own buffers
+    //! (process_async) before the ABI call returns.
+    std::vector<rsinfer::OpenVINOInputView> make_views(const RSInferTensorArray* input_tensors)
     {
         if (!input_tensors || (input_tensors->length && !input_tensors->tensors))
             throw std::invalid_argument("Input tensor array is null or malformed");
-        std::vector<rsinfer::Tensor> inputs;
+        std::vector<rsinfer::OpenVINOInputView> inputs;
         inputs.reserve(input_tensors->length);
         for (size_t i = 0; i < input_tensors->length; ++i)
         {
@@ -293,15 +296,20 @@ namespace
                 (source->data->length && !source->data->data))
                 throw std::invalid_argument("Input tensor is missing name, data, or shape");
 
-            rsinfer::Tensor tensor;
+            rsinfer::OpenVINOInputView view;
             if (source->name_length)
-                tensor.name.assign(source->name, source->name_length);
-            tensor.dtype = to_internal_type(source->dtype);
-            if (source->shape->length)
-                tensor.shape.assign(source->shape->data, source->shape->data + source->shape->length);
-            if (source->data->length)
-                tensor.data.assign(source->data->data, source->data->data + source->data->length);
-            inputs.push_back(std::move(tensor));
+                view.name = std::string_view(source->name, source->name_length);
+            view.dtype = to_internal_type(source->dtype);
+            view.shape.reserve(source->shape->length);
+            for (size_t d = 0; d < source->shape->length; ++d)
+            {
+                const long long dim = source->shape->data[d];
+                if (dim < 0 || static_cast<unsigned long long>(dim) > std::numeric_limits<size_t>::max())
+                    throw std::invalid_argument("Tensor shape contains an invalid dimension");
+                view.shape.push_back(static_cast<size_t>(dim));
+            }
+            view.data = std::span<const unsigned char>(source->data->data, source->data->length);
+            inputs.push_back(std::move(view));
         }
         return inputs;
     }
@@ -401,7 +409,8 @@ int rs_inference_runner_infer(RSInferenceRunner* runner, RSInferTensorArray* inp
     try
     {
         auto* backend = get_runner(runner);
-        backend->process(make_inputs(input_tensors));
+        const auto inputs = make_views(input_tensors);
+        backend->process(std::span<const rsinfer::OpenVINOInputView>(inputs));
         return ERROR_CODE_SUCCESS;
     }
     catch (const std::invalid_argument& e)
@@ -421,7 +430,8 @@ int rs_inference_runner_infer_async(RSInferenceRunner* runner, RSInferTensorArra
     try
     {
         auto* backend = get_runner(runner);
-        backend->process_async(make_inputs(input_tensors));
+        const auto inputs = make_views(input_tensors);
+        backend->process_async(std::span<const rsinfer::OpenVINOInputView>(inputs));
         return ERROR_CODE_SUCCESS;
     }
     catch (const std::invalid_argument& e)
