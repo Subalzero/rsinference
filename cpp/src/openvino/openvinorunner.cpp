@@ -197,8 +197,7 @@ namespace rsinfer
         _compiled_model = std::move(temp._compiled_model);
         _infer_requests = std::move(temp._infer_requests);
         _idle_requests = std::move(temp._idle_requests);
-        _completions = std::move(temp._completions);
-        _pending_requests = std::exchange(temp._pending_requests, 0);
+        _completions = std::exchange(temp._completions, Completions{});
     }
 
     OpenVINORunner& OpenVINORunner::operator=(OpenVINORunner&& temp) noexcept
@@ -219,8 +218,7 @@ namespace rsinfer
         _compiled_model = std::move(temp._compiled_model);
         _infer_requests = std::move(temp._infer_requests);
         _idle_requests = std::move(temp._idle_requests);
-        _completions = std::move(temp._completions);
-        _pending_requests = std::exchange(temp._pending_requests, 0);
+        _completions = std::exchange(temp._completions, Completions{});
         return *this;
     }
 
@@ -331,21 +329,46 @@ namespace rsinfer
         return _params;
     }
 
-    void OpenVINORunner::begin_request()
+    uint64_t OpenVINORunner::begin_request()
     {
         std::lock_guard<std::mutex> lock(_completions_mut);
         if (_params.modelXmlPath.empty())
             throw std::runtime_error("OpenVINO runner is not initialized");
-        ++_pending_requests;
         ++_active_calls;
+        // The ticket fixes this request's place in get()'s order.
+        return _completions.reserve();
     }
 
     void OpenVINORunner::finish_request() noexcept
     {
         {
             std::lock_guard<std::mutex> lock(_completions_mut);
-            --_pending_requests;
             --_active_calls;
+        }
+        _completions_cond.notify_all();
+    }
+
+    void OpenVINORunner::complete_request(uint64_t ticket, Completion completion) noexcept
+    {
+        {
+            std::lock_guard<std::mutex> lock(_completions_mut);
+            try
+            {
+                _completions.complete(ticket, std::move(completion));
+            }
+            catch (...)
+            {
+                _completions.cancel(ticket);
+            }
+        }
+        _completions_cond.notify_all();
+    }
+
+    void OpenVINORunner::cancel_request(uint64_t ticket) noexcept
+    {
+        {
+            std::lock_guard<std::mutex> lock(_completions_mut);
+            _completions.cancel(ticket);
         }
         _completions_cond.notify_all();
     }
@@ -434,18 +457,15 @@ namespace rsinfer
 
     void OpenVINORunner::process(const std::vector<rsinfer::Tensor>& input_tensors)
     {
-        begin_request();
+        const uint64_t ticket = begin_request();
         try
         {
-            auto result = process_impl(input_tensors);
-            {
-                std::lock_guard<std::mutex> lock(_completions_mut);
-                _completions.emplace(std::move(result));
-            }
-            _completions_cond.notify_one();
+            complete_request(ticket, process_impl(input_tensors));
         }
         catch (...)
         {
+            // The error goes to this caller; get() skips the ticket.
+            cancel_request(ticket);
             finish_request();
             throw;
         }
@@ -454,34 +474,29 @@ namespace rsinfer
 
     void OpenVINORunner::process_async(const std::vector<rsinfer::Tensor>& input_tensors)
     {
-        begin_request();
+        const uint64_t ticket = begin_request();
         try
         {
-            std::thread([this](std::vector<rsinfer::Tensor> inputs)
+            std::thread([this, ticket](std::vector<rsinfer::Tensor> inputs)
             {
                 try
                 {
-                    auto result = process_impl(inputs);
-                    {
-                        std::lock_guard<std::mutex> lock(_completions_mut);
-                        _completions.emplace(std::move(result));
-                    }
+                    complete_request(ticket, process_impl(inputs));
                 }
                 catch (const std::exception& e)
                 {
-                    std::lock_guard<std::mutex> lock(_completions_mut);
-                    _completions.emplace(std::string(e.what()));
+                    complete_request(ticket, std::string(e.what()));
                 }
                 catch (...)
                 {
-                    std::lock_guard<std::mutex> lock(_completions_mut);
-                    _completions.emplace(std::string("unknown asynchronous inference failure"));
+                    complete_request(ticket, std::string("unknown asynchronous inference failure"));
                 }
                 finish_request();
             }, input_tensors).detach();
         }
         catch (...)
         {
+            cancel_request(ticket);
             finish_request();
             throw;
         }
@@ -490,18 +505,14 @@ namespace rsinfer
     void OpenVINORunner::get(std::vector<rsinfer::Tensor>& output_tensors)
     {
         std::unique_lock<std::mutex> lock(_completions_mut);
-        _completions_cond.wait(lock, [this]() {
-            return !_completions.empty() || _pending_requests == 0;
-        });
-        if (_completions.empty())
-            throw std::runtime_error("No inference request is pending");
-
-        Completion completion = std::move(_completions.front());
-        _completions.pop();
+        _completions_cond.wait(lock, [this]() { return _completions.ready(); });
+        std::optional<Completion> completion = _completions.take();
         lock.unlock();
-        if (const auto* error = std::get_if<std::string>(&completion))
+        if (!completion)
+            throw std::runtime_error("No inference request is pending");
+        if (const auto* error = std::get_if<std::string>(&*completion))
             throw std::runtime_error(*error);
-        output_tensors = std::move(std::get<std::vector<rsinfer::Tensor>>(completion));
+        output_tensors = std::move(std::get<std::vector<rsinfer::Tensor>>(*completion));
     }
 
     std::vector<std::string> OpenVINORunner::get_available_devices()

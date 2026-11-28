@@ -301,16 +301,16 @@ impl InferInstance<'_> {
 
     /// Runs inference and waits for it. Fetch the outputs with [`get_results`](Self::get_results).
     ///
-    /// The bridge reads the input data in place for the duration of the call
-    /// (see [`BorrowedInputs`]); nothing is copied on the Rust side.
+    /// The bridge reads the input data in place for the duration of the call;
+    /// nothing is copied on the Rust side.
     pub fn infer(&self, inputs: &[Tensor]) -> InferResult<()> {
         let infer = self.engine.bridge.runner_infer;
         self.call_infer(inputs, "runner_infer", |array, err| unsafe { infer(self.runner, array, err) })
     }
 
     /// Queues inference and returns once the bridge has taken a copy of the
-    /// inputs. Fetch the outputs with [`get_results`](Self::get_results), in
-    /// submission order.
+    /// inputs. Fetch the outputs with [`get_results`](Self::get_results); see
+    /// there for the order they come back in.
     pub fn infer_async(&self, inputs: &[Tensor]) -> InferResult<()> {
         let infer_async = self.engine.bridge.runner_infer_async;
         self.call_infer(inputs, "runner_infer_async", |array, err| unsafe { infer_async(self.runner, array, err) })
@@ -333,6 +333,19 @@ impl InferInstance<'_> {
         Ok(())
     }
 
+    /// Outputs of the oldest [`infer`](Self::infer) or
+    /// [`infer_async`](Self::infer_async) call whose results have not been
+    /// fetched yet, waiting for it to finish if needed.
+    ///
+    /// Results come back in the order those calls were made, even when the
+    /// backend runs several requests at once (TensorRT `n_contexts`, OpenVINO
+    /// `num_infer_requests`) and a later one finishes first. Calls that
+    /// returned an error themselves are skipped. With calls made from several
+    /// threads at once, "order" is the order the calls reached the bridge.
+    /// A request that failed while running asynchronously is reported here, as
+    /// the error for its place in the order.
+    ///
+    /// Returns an error when no request is waiting to be fetched.
     pub fn get_results(&self) -> InferResult<Vec<Tensor>> {
         let mut err = RSInferError::default();
         let ptr = unsafe { (self.engine.bridge.runner_get_results)(self.runner, &mut err) };
@@ -849,6 +862,65 @@ mod tests {
             instance.infer_async(&[sample_input()]).unwrap();
             assert_sample_outputs(&instance.get_results().unwrap());
             assert_sample_outputs(&instance.get_results().unwrap());
+        }
+    }
+
+    /// A sample input filled with one float value, so different requests can
+    /// be told apart by their outputs.
+    fn filled_input(fill: f32) -> Tensor {
+        let mut input = sample_input();
+        input.data = std::iter::repeat_n(fill.to_ne_bytes(), 3 * 480 * 640).flatten().collect();
+        input
+    }
+
+    /// Submits several different inputs asynchronously to a backend that runs
+    /// them concurrently, then checks each result belongs to the request in its
+    /// position: get_results must follow submission order, not completion order.
+    fn assert_async_results_in_submission_order(engine: &Engine, config: &str) {
+        let fills = [0.0f32, 0.5, -0.25, 1.0, 0.75, -1.0, 0.25, -0.5];
+        let reference = engine.create_infer_instance(&sample_model(), None).unwrap();
+        let expected: Vec<Vec<Tensor>> = fills
+            .iter()
+            .map(|&fill| {
+                reference.infer(&[filled_input(fill)]).unwrap();
+                reference.get_results().unwrap()
+            })
+            .collect();
+        for pair in expected.windows(2) {
+            assert_ne!(pair[0], pair[1], "inputs must give distinguishable outputs");
+        }
+
+        let concurrent = engine.create_infer_instance(&sample_model(), Some(config)).unwrap();
+        for round in 0..3 {
+            for &fill in &fills {
+                concurrent.infer_async(&[filled_input(fill)]).unwrap();
+            }
+            for (i, want) in expected.iter().enumerate() {
+                let got = concurrent.get_results().unwrap();
+                // Exact equality would also hold on TensorRT, but OpenVINO may
+                // pick a different kernel per request; compare within tolerance.
+                for (g, w) in got.iter().zip(want) {
+                    assert_eq!(g.name, w.name);
+                    let (g, w) = (as_f32(&g.data), as_f32(&w.data));
+                    let max_diff = g.iter().zip(&w).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    assert!(max_diff < 1e-3, "round {round}: result {i} does not match its input (max diff {max_diff})");
+                }
+            }
+            assert!(concurrent.get_results().is_err(), "no results should be left over");
+        }
+    }
+
+    hardware_test! {
+        fn tensorrt_async_results_follow_submission_order() {
+            let Some(engine) = tensorrt_engine() else { return };
+            assert_async_results_in_submission_order(&engine, r#"{"n_contexts": 4}"#);
+        }
+    }
+
+    hardware_test! {
+        fn openvino_async_results_follow_submission_order() {
+            let Some(engine) = openvino_engine() else { return };
+            assert_async_results_in_submission_order(&engine, r#"{"num_infer_requests": 4}"#);
         }
     }
 

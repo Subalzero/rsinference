@@ -71,6 +71,9 @@ namespace rsinfer
 				throw std::runtime_error(std::string(what) + " failed: " + cudaGetErrorString(status));
 		}
 
+		//! Transient graph capture failures after which a context stops trying.
+		constexpr uint32_t kMaxTransientCaptureFailures = 3;
+
 		int64_t volume(const nvinfer1::Dims& dims)
 		{
 			int64_t v = 1;
@@ -133,28 +136,6 @@ namespace rsinfer
 		_params(params)
 	{
 
-	}
-
-	TensorRTRunner::TensorRTRunner(TensorRTRunner&& temp) noexcept
-	{
-		_params = std::move(temp._params);
-		_engine = std::move(temp._engine);
-		_runtime = std::move(temp._runtime);
-
-		temp._engine.reset();
-		temp._runtime.reset();
-	}
-
-	TensorRTRunner& TensorRTRunner::operator=(TensorRTRunner&& temp) noexcept
-	{
-		_params = std::move(temp._params);
-		_engine = std::move(temp._engine);
-		_runtime = std::move(temp._runtime);
-
-		temp._engine.reset();
-		temp._runtime.reset();
-
-		return *this;
 	}
 
 	bool TensorRTRunner::build(const std::function<bool(IOptimizationProfile*)>& optimization)
@@ -334,6 +315,17 @@ namespace rsinfer
 		for (int32_t i = 0, n = _engine->getNbIOTensors(); i < n; ++i)
 		{
 			const char* name = _engine->getIOTensorName(i);
+			// Buffers are sized and filled as dense row-major tensors. Vectorized
+			// or channel-last I/O formats need padded buffers and a different
+			// data layout, so refuse them instead of reading or writing out of bounds.
+			if (_engine->getTensorFormat(name) != nvinfer1::TensorFormat::kLINEAR
+				|| _engine->getTensorVectorizedDim(name) != -1)
+			{
+				sample::gLogError << "I/O tensor '" << name << "' uses the non-linear format "
+					<< _engine->getTensorFormatDesc(name)
+					<< "; only linear (row-major) I/O tensors are supported" << std::endl;
+				return false;
+			}
 			_io.push_back({ name, _engine->getTensorIOMode(name) == TensorIOMode::kINPUT, _engine->getTensorDataType(name) });
 		}
 		auto index_of = [this](const std::string& name) -> std::optional<size_t>
@@ -502,13 +494,7 @@ namespace rsinfer
 
 			if (view.dtype != to_inferrs_data_type(_io[idx].type))
 				throw std::runtime_error("Input tensor '" + _io[idx].name + "' has a data type that does not match the engine");
-			if (view.shape.size() > static_cast<size_t>(nvinfer1::Dims::MAX_DIMS))
-				throw std::runtime_error("Input tensor '" + _io[idx].name + "' has too many dimensions");
-			nvinfer1::Dims dims{};
-			dims.nbDims = static_cast<int32_t>(view.shape.size());
-			for (int32_t d = 0; d < dims.nbDims; ++d)
-				dims.d[d] = view.shape[d];
-			if (!context->setInputShape(_io[idx].name.c_str(), dims))
+			if (!context->setInputShape(_io[idx].name.c_str(), view.shape))
 				throw std::runtime_error("setInputShape failed for tensor: " + _io[idx].name);
 		}
 		if (!context->allInputDimensionsSpecified())
@@ -603,27 +589,39 @@ namespace rsinfer
 		// change, so a shape is captured only once it has run directly.
 		if (_params.cudaGraph && !slot.graph_unsupported && slot.ran_direct)
 		{
-			if (capture_graph(slot))
+			switch (capture_graph(slot))
 			{
+			case CaptureResult::Captured:
 				check_cuda(cudaGraphLaunch(slot.graph, slot.stream), "cudaGraphLaunch");
 				return;
+			case CaptureResult::Unsupported:
+				slot.graph_unsupported = true;
+				sample::gLogWarning << "CUDA graph capture is not supported for this engine; using enqueueV3 directly" << std::endl;
+				break;
+			case CaptureResult::Transient:
+				// Retry on a later request, but stop trying if it keeps failing.
+				if (++slot.transient_capture_failures >= kMaxTransientCaptureFailures)
+				{
+					slot.graph_unsupported = true;
+					sample::gLogWarning << "CUDA graph capture failed " << kMaxTransientCaptureFailures
+						<< " times; using enqueueV3 directly" << std::endl;
+				}
+				break;
 			}
-			slot.graph_unsupported = true;
-			sample::gLogWarning << "CUDA graph capture is not supported for this engine; using enqueueV3 directly" << std::endl;
 		}
 
 		record_work(slot);
 		slot.ran_direct = true;
 	}
 
-	bool TensorRTRunner::capture_graph(Slot& slot)
+	TensorRTRunner::CaptureResult TensorRTRunner::capture_graph(Slot& slot)
 	{
 		// Thread-local mode: other threads may allocate (other slots growing
 		// their buffers) while this stream is being captured.
 		if (cudaStreamBeginCapture(slot.stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess)
 		{
 			cudaGetLastError();
-			return false;
+			return CaptureResult::Transient;
 		}
 
 		bool recorded = true;
@@ -640,20 +638,29 @@ namespace rsinfer
 		// Always end the capture, or the stream stays unusable.
 		cudaGraph_t graph = nullptr;
 		const cudaError_t end_status = cudaStreamEndCapture(slot.stream, &graph);
+		if (!recorded || end_status != cudaSuccess || !graph)
+		{
+			// The engine's work itself could not be recorded (e.g. it calls
+			// something capture does not allow): retrying will not help.
+			if (graph)
+				cudaGraphDestroy(graph);
+			cudaGetLastError(); // capture errors are not sticky; clear them
+			return CaptureResult::Unsupported;
+		}
+
 		cudaGraphExec_t exec = nullptr;
-		const bool ok = recorded && end_status == cudaSuccess && graph
-			&& cudaGraphInstantiate(&exec, graph, 0) == cudaSuccess;
-		if (graph)
-			cudaGraphDestroy(graph);
-		if (!ok)
+		const cudaError_t instantiate_status = cudaGraphInstantiate(&exec, graph, 0);
+		cudaGraphDestroy(graph);
+		if (instantiate_status != cudaSuccess)
 		{
 			if (exec)
 				cudaGraphExecDestroy(exec);
-			cudaGetLastError(); // capture errors are not sticky; clear them
-			return false;
+			cudaGetLastError();
+			sample::gLogWarning << "cudaGraphInstantiate failed: " << cudaGetErrorString(instantiate_status) << std::endl;
+			return CaptureResult::Transient;
 		}
 		slot.graph = exec;
-		return true;
+		return CaptureResult::Captured;
 	}
 
 	void TensorRTRunner::destroy_graph(Slot& slot) noexcept
@@ -683,13 +690,38 @@ namespace rsinfer
 		return outputs;
 	}
 
-	void TensorRTRunner::push_completion(Completion completion)
+	uint64_t TensorRTRunner::reserve_ticket()
+	{
+		std::lock_guard<std::mutex> lock(_completions_mut);
+		return _completions.reserve();
+	}
+
+	void TensorRTRunner::complete_ticket(uint64_t ticket, Completion completion) noexcept
 	{
 		{
 			std::lock_guard<std::mutex> lock(_completions_mut);
-			_completions.emplace(std::move(completion));
+			try
+			{
+				_completions.complete(ticket, std::move(completion));
+			}
+			catch (...)
+			{
+				// Out of memory storing the result: report it as an error rather
+				// than leaving get() waiting for this ticket forever.
+				_completions.cancel(ticket);
+				sample::gLogError << "Could not store an inference result" << std::endl;
+			}
 		}
-		_completions_cond.notify_one();
+		_completions_cond.notify_all();
+	}
+
+	void TensorRTRunner::cancel_ticket(uint64_t ticket) noexcept
+	{
+		{
+			std::lock_guard<std::mutex> lock(_completions_mut);
+			_completions.cancel(ticket);
+		}
+		_completions_cond.notify_all();
 	}
 
 	std::vector<TensorView> TensorRTRunner::views_of(const std::vector<Tensor>& tensors)
@@ -697,7 +729,7 @@ namespace rsinfer
 		std::vector<TensorView> views;
 		views.reserve(tensors.size());
 		for (const auto& t : tensors)
-			views.push_back({ t.name, t.shape, t.dtype, t.data });
+			views.push_back(TensorView::make(t.name, t.shape.data(), t.shape.size(), t.dtype, t.data));
 		return views;
 	}
 
@@ -709,23 +741,16 @@ namespace rsinfer
 
 	void TensorRTRunner::process(std::span<const TensorView> input_tensors)
 	{
-		{
-			std::lock_guard<std::mutex> lock(_completions_mut);
-			++_pending_requests;
-		}
-
+		// The ticket fixes this request's place in get()'s order.
+		const uint64_t ticket = reserve_ticket();
 		try
 		{
 			Slot* slot = enqueue(input_tensors);
 			const cudaError_t status = cudaStreamSynchronize(slot->stream);
-			if (status != cudaSuccess)
-			{
-				return_slot(slot);
-				check_cuda(status, "TensorRT inference");
-			}
-			Completion outputs;
+			std::optional<Completion> outputs;
 			try
 			{
+				check_cuda(status, "TensorRT inference");
 				outputs = collect_outputs(*slot);
 			}
 			catch (...)
@@ -733,16 +758,17 @@ namespace rsinfer
 				return_slot(slot);
 				throw;
 			}
+			// Queue the result before freeing the slot, so a later request on
+			// this slot can never be ordered ahead of it.
+			complete_ticket(ticket, std::move(*outputs));
 			return_slot(slot);
-			push_completion(std::move(outputs));
 		}
 		catch (...)
 		{
-			finish_request();
+			// The error goes to this caller; get() skips the ticket.
+			cancel_ticket(ticket);
 			throw;
 		}
-
-		finish_request();
 	}
 
 	void TensorRTRunner::process_async(const std::vector<Tensor>& input_tensors)
@@ -753,11 +779,7 @@ namespace rsinfer
 
 	void TensorRTRunner::process_async(std::span<const TensorView> input_tensors)
 	{
-		{
-			std::lock_guard<std::mutex> lock(_completions_mut);
-			++_pending_requests;
-		}
-
+		const uint64_t ticket = reserve_ticket();
 		Slot* slot = nullptr;
 		try
 		{
@@ -765,9 +787,10 @@ namespace rsinfer
 		}
 		catch (...)
 		{
-			finish_request();
+			cancel_ticket(ticket);
 			throw;
 		}
+		slot->ticket = ticket;
 
 		{
 			std::lock_guard<std::mutex> lock(_inflight_mut);
@@ -806,17 +829,10 @@ namespace rsinfer
 			}
 		}
 
-		// The stream has drained up to this callback, so the slot is free.
+		// Queue the result before freeing the slot (see process()). The slot's
+		// ticket must be read before return_slot hands it to another request.
+		self->complete_ticket(slot->ticket, std::move(completion));
 		self->return_slot(slot);
-		try
-		{
-			self->push_completion(std::move(completion));
-		}
-		catch (...)
-		{
-			sample::gLogError << "process_async: could not queue the result" << std::endl;
-		}
-		self->finish_request();
 
 		std::lock_guard<std::mutex> lock(self->_inflight_mut);
 		--self->_inflight;
@@ -826,28 +842,15 @@ namespace rsinfer
 	void TensorRTRunner::get(std::vector<Tensor>& result)
 	{
 		std::unique_lock<std::mutex> completions_lock(_completions_mut);
-		_completions_cond.wait(completions_lock, [&]() {
-			return !_completions.empty() || _pending_requests == 0;
-		});
-		if (_completions.empty())
+		_completions_cond.wait(completions_lock, [&]() { return _completions.ready(); });
+		std::optional<Completion> completion = _completions.take();
+		completions_lock.unlock();
+		if (!completion)
 			throw std::runtime_error("No inference request is pending");
 
-		Completion completion = std::move(_completions.front());
-		_completions.pop();
-		completions_lock.unlock();
-
-		if (auto* error = std::get_if<std::string>(&completion))
+		if (auto* error = std::get_if<std::string>(&*completion))
 			throw std::runtime_error(*error);
-		result = std::move(std::get<std::vector<Tensor>>(completion));
-	}
-
-	void TensorRTRunner::finish_request()
-	{
-		{
-			std::lock_guard<std::mutex> lock(_completions_mut);
-			--_pending_requests;
-		}
-		_completions_cond.notify_all();
+		result = std::move(std::get<std::vector<Tensor>>(*completion));
 	}
 
 	std::vector<int> TensorRTRunner::get_input_shape(uint32_t index) const

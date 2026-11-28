@@ -19,12 +19,15 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use rsinference::engine::{Engine, EngineType};
-use rsinference::types::{Dtype, Tensor};
+use rsinference::types::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let model = PathBuf::from(args.next().unwrap_or_else(|| "models/version-RFB-640.onnx".into()));
     let iterations: usize = args.next().map(|v| v.parse()).transpose()?.unwrap_or(1000);
+    if iterations == 0 {
+        return Err("iterations must be at least 1".into());
+    }
     let warmup: usize = args.next().map(|v| v.parse()).transpose()?.unwrap_or(100);
     let backend = match args.next().as_deref().unwrap_or("tensorrt") {
         "tensorrt" => EngineType::TensorRT,
@@ -56,7 +59,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|(i, &d)| if d < 0 { *fallback.get(i).unwrap_or(&1) } else { d })
                 .collect();
             let elems: usize = shape.iter().map(|&d| d as usize).product();
-            let bytes = elems * dtype_size(info.dtype);
+            // byte_count handles packed 4-bit types (two elements per byte).
+            let bytes = info.dtype.byte_count(elems);
             let mut state = 0x2545_f491_u32;
             let data = (0..bytes)
                 .map(|_| {
@@ -122,15 +126,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     report("infer_async + get_results", &mut per_request);
     println!("throughput:                  {:.1} req/s ({total} requests)", total as f64 / wall.as_secs_f64());
     Ok(())
-}
-
-fn dtype_size(dtype: Dtype) -> usize {
-    match dtype {
-        Dtype::F32 | Dtype::I32 => 4,
-        Dtype::I64 => 8,
-        Dtype::F16 | Dtype::BF16 => 2,
-        _ => 1,
-    }
 }
 
 fn ms(d: Duration) -> f64 {

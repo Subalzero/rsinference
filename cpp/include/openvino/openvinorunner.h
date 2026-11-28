@@ -1,6 +1,7 @@
 #ifndef OPENVINO_RUNNER_H
 #define OPENVINO_RUNNER_H
 
+#include "common/orderedcompletions.h"
 #include "common/tensor.h"
 
 #include <condition_variable>
@@ -92,10 +93,14 @@ namespace rsinfer
         // joins their worker threads, which deadlocks on Windows.
         static ov::Core& core();
 
-        using Completion = std::variant<std::vector<rsinfer::Tensor>, std::string>;
+        using Completions = OrderedCompletions<std::vector<rsinfer::Tensor>>;
+        using Completion = Completions::Completion;
 
-        void begin_request();
+        //! Takes the request's completion ticket and counts it as an active call.
+        uint64_t begin_request();
         void finish_request() noexcept;
+        void complete_request(uint64_t ticket, Completion completion) noexcept;
+        void cancel_request(uint64_t ticket) noexcept;
         std::vector<rsinfer::Tensor> process_impl(const std::vector<rsinfer::Tensor>& input_tensors);
 
         OpenVINORunnerParams _params;
@@ -105,14 +110,13 @@ namespace rsinfer
         std::vector<ov::InferRequest> _infer_requests;
         std::queue<ov::InferRequest*> _idle_requests;
 
-        std::queue<Completion> _completions;
+        Completions _completions; //!< Results in submission order; guarded by _completions_mut.
 
         std::mutex _idle_requests_mut;
         std::condition_variable _idle_requests_cond;
 
         std::mutex _completions_mut;
         std::condition_variable _completions_cond;
-        size_t _pending_requests{ 0 };
         size_t _active_calls{ 0 };
     };
 }

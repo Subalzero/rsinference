@@ -13,8 +13,6 @@
 
 #include <nlohmann/json.hpp>
 
-// Input shapes (long long in the C ABI) are viewed in place as int64_t.
-static_assert(sizeof(long long) == sizeof(int64_t), "long long and int64_t must have the same size");
 
 enum ErrorCodes
 {
@@ -711,6 +709,15 @@ int rs_inference_runner_infer(RSInferenceRunner* runner, RSInferTensorArray* inp
     try
     {
         auto tensorrtrunner = static_cast<rsinfer::TensorRTRunner*>(runner->runner);
+        if (input_tensors->length && !input_tensors->tensors)
+        {
+            if (error)
+            {
+                error->code = ERROR_CODE_INVALID_ARGUMENTS;
+                error->message = strdup("Input tensor array is null or malformed");
+            }
+            return ERROR_CODE_INVALID_ARGUMENTS;
+        }
         std::vector<rsinfer::TensorView> inputs;
         inputs.reserve(input_tensors->length);
 
@@ -732,12 +739,10 @@ int rs_inference_runner_infer(RSInferenceRunner* runner, RSInferTensorArray* inp
             }
             // Borrow the caller's buffers; the runner copies them into pinned
             // memory before returning, so nothing here outlives this call.
-            rsinfer::TensorView view;
-            view.name = tensor->name ? std::string_view(tensor->name, tensor->name_length) : std::string_view{};
-            view.shape = std::span<const int64_t>(reinterpret_cast<const int64_t*>(tensor->shape->data), tensor->shape->length);
-            view.dtype = rsinfer::from_public_data_type(tensor->dtype);
-            view.data = std::span<const unsigned char>(tensor->data->data, tensor->data->length);
-            inputs.push_back(view);
+            inputs.push_back(rsinfer::TensorView::make(
+                tensor->name ? std::string_view(tensor->name, tensor->name_length) : std::string_view{},
+                tensor->shape->data, tensor->shape->length, rsinfer::from_public_data_type(tensor->dtype),
+                std::span<const unsigned char>(tensor->data->data, tensor->data->length)));
         }
 
         tensorrtrunner->process(std::span<const rsinfer::TensorView>(inputs));
@@ -770,6 +775,15 @@ int rs_inference_runner_infer_async(RSInferenceRunner* runner, RSInferTensorArra
     try
     {
         auto tensorrtrunner = static_cast<rsinfer::TensorRTRunner*>(runner->runner);
+        if (input_tensors->length && !input_tensors->tensors)
+        {
+            if (error)
+            {
+                error->code = ERROR_CODE_INVALID_ARGUMENTS;
+                error->message = strdup("Input tensor array is null or malformed");
+            }
+            return ERROR_CODE_INVALID_ARGUMENTS;
+        }
         std::vector<rsinfer::TensorView> inputs;
         inputs.reserve(input_tensors->length);
 
@@ -791,12 +805,10 @@ int rs_inference_runner_infer_async(RSInferenceRunner* runner, RSInferTensorArra
             }
             // Borrow the caller's buffers; the runner copies them into pinned
             // memory before returning, so nothing here outlives this call.
-            rsinfer::TensorView view;
-            view.name = tensor->name ? std::string_view(tensor->name, tensor->name_length) : std::string_view{};
-            view.shape = std::span<const int64_t>(reinterpret_cast<const int64_t*>(tensor->shape->data), tensor->shape->length);
-            view.dtype = rsinfer::from_public_data_type(tensor->dtype);
-            view.data = std::span<const unsigned char>(tensor->data->data, tensor->data->length);
-            inputs.push_back(view);
+            inputs.push_back(rsinfer::TensorView::make(
+                tensor->name ? std::string_view(tensor->name, tensor->name_length) : std::string_view{},
+                tensor->shape->data, tensor->shape->length, rsinfer::from_public_data_type(tensor->dtype),
+                std::span<const unsigned char>(tensor->data->data, tensor->data->length)));
         }
 
         tensorrtrunner->process_async(std::span<const rsinfer::TensorView>(inputs));

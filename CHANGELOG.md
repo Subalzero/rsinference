@@ -36,7 +36,23 @@
 - TensorRT `cuda_graph` (boolean, default `true`): set it to `false` to always
   run `enqueueV3` directly. It is reported by `json_config`.
 
+### Behavior changes (all backends)
+
+- **`get_results` returns results in submission order.** Each `infer` /
+  `infer_async` call takes its place in line when it is made, and `get_results`
+  waits for the oldest one, even when a later request on another TensorRT
+  context (`n_contexts`) or OpenVINO infer request (`num_infer_requests`)
+  finishes first. Previously results came back in completion order, so with
+  more than one context outputs could be matched to the wrong inputs; on
+  TensorRT this could even happen with one context when two threads raced.
+  Calls that return an error themselves are skipped.
+
 ### Behavior changes (TensorRT)
+
+- Engines whose I/O tensors use a non-linear (vectorized or channel-last)
+  format are rejected when the runner is created. Their buffers need padding
+  and a different data layout; previously such engines ran on undersized
+  buffers.
 
 - `infer_async` validates its inputs before returning, so a wrong name, data
   type, shape or size is reported by `infer_async` itself rather than by the

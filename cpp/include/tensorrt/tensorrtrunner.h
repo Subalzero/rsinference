@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/orderedcompletions.h"
 #include "common/tensor.h"
 
 #include "argsParser.h"
@@ -13,6 +14,8 @@
 #include <map>
 #include <optional>
 #include <span>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <variant>
@@ -77,12 +80,32 @@ namespace rsinfer
     //! Borrowed view of one input tensor. The runner reads `data` while the call
     //! that receives the view runs (it copies the bytes into pinned memory before
     //! returning, also for process_async), so the caller may free it afterwards.
+    //! The shape is copied in, so views can be built from any integer type
+    //! without aliasing it (see make()).
     struct TensorView
     {
         std::string_view name;
-        std::span<const int64_t> shape;
+        nvinfer1::Dims shape{};
         rsinfer::DataType dtype{ rsinfer::DataType::FP32 };
         std::span<const unsigned char> data;
+
+        //! Throws std::invalid_argument when the rank exceeds Dims::MAX_DIMS.
+        template <class Dim>
+        static TensorView make(std::string_view name, const Dim* shape, size_t rank, rsinfer::DataType dtype,
+            std::span<const unsigned char> data)
+        {
+            if (rank > static_cast<size_t>(nvinfer1::Dims::MAX_DIMS))
+                throw std::invalid_argument("Input tensor '" + std::string(name) + "' has more than "
+                    + std::to_string(nvinfer1::Dims::MAX_DIMS) + " dimensions");
+            TensorView view;
+            view.name = name;
+            view.shape.nbDims = static_cast<int32_t>(rank);
+            for (size_t d = 0; d < rank; ++d)
+                view.shape.d[d] = static_cast<int64_t>(shape[d]);
+            view.dtype = dtype;
+            view.data = data;
+            return view;
+        }
     };
 
     class TensorRTRunner
@@ -93,11 +116,12 @@ namespace rsinfer
 
         TensorRTRunner(const RunnerParams& params);
 
+        // Not copyable or movable: execution slots point back at their runner,
+        // and their execution contexts must not outlive its engine.
         TensorRTRunner(const TensorRTRunner& copy) = delete;
         TensorRTRunner& operator=(const TensorRTRunner& copy) = delete;
-
-        TensorRTRunner(TensorRTRunner&& temp) noexcept;
-        TensorRTRunner& operator=(TensorRTRunner&& temp) noexcept;
+        TensorRTRunner(TensorRTRunner&& temp) = delete;
+        TensorRTRunner& operator=(TensorRTRunner&& temp) = delete;
 
         bool build(const std::function<bool(IOptimizationProfile*)>& optimization = {});
 
@@ -110,6 +134,8 @@ namespace rsinfer
         void process_async(std::span<const TensorView> input_tensors);
         void process_async(const std::vector<Tensor>& input_tensors);
 
+        //! Returns the results of the oldest request not yet fetched, in the
+        //! order process/process_async were called (waiting for it if needed).
         void get(std::vector<Tensor>& result);
 
         std::vector<int> get_input_shape(uint32_t index) const;
@@ -171,8 +197,13 @@ namespace rsinfer
             //! The last request ran directly with `graph_key`, so TensorRT has done
             //! its deferred work for these shapes and the next one may be captured.
             bool ran_direct{ false };
-            //! Capture failed once; this context always runs directly.
+            //! Capture is not possible for this engine (or failed too often);
+            //! this context always runs directly.
             bool graph_unsupported{ false };
+            //! Captures that failed for reasons that may pass (e.g. out of memory).
+            uint32_t transient_capture_failures{ 0 };
+            //! Completion ticket of the async request running on this slot.
+            uint64_t ticket{ 0 };
         };
 
         std::vector<IOTensor> _io;
@@ -184,11 +215,11 @@ namespace rsinfer
         std::mutex _idle_slots_mut;
         std::condition_variable _idle_slots_cond;
 
-        using Completion = std::variant<std::vector<Tensor>, std::string>;
-        std::queue<Completion> _completions;
+        using Completions = OrderedCompletions<std::vector<Tensor>>;
+        using Completion = Completions::Completion;
+        Completions _completions; //!< Guarded by _completions_mut.
         std::mutex _completions_mut;
         std::condition_variable _completions_cond;
-        size_t _pending_requests{ 0 };
 
         //! Requests whose stream callback has not run yet; the destructor waits for them.
         int _inflight = 0;
@@ -207,11 +238,13 @@ namespace rsinfer
         void record_work(Slot& slot);
         //! Runs the queued request through the slot's graph when possible.
         void launch(Slot& slot, std::vector<int64_t>&& key, bool buffers_moved);
-        bool capture_graph(Slot& slot);
+        enum class CaptureResult { Captured, Unsupported, Transient };
+        CaptureResult capture_graph(Slot& slot);
         static void destroy_graph(Slot& slot) noexcept;
         std::vector<Tensor> collect_outputs(const Slot& slot) const;
-        void push_completion(Completion completion);
-        void finish_request();
+        uint64_t reserve_ticket();
+        void complete_ticket(uint64_t ticket, Completion completion) noexcept;
+        void cancel_ticket(uint64_t ticket) noexcept;
         static void CUDART_CB on_stream_complete(cudaStream_t stream, cudaError_t status, void* user_data);
         static std::vector<TensorView> views_of(const std::vector<Tensor>& tensors);
 
